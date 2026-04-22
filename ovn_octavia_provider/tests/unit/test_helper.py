@@ -4061,13 +4061,13 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
 
     def test__ls_is_provider_network_false(self):
         # Create a logical switch without provider network external_id
-        tenant_ls = fakes.FakeOvsdbRow.create_one_ovsdb_row(
-            attrs={'name': 'tenant-network',
+        project_ls = fakes.FakeOvsdbRow.create_one_ovsdb_row(
+            attrs={'name': 'project-network',
                    'ports': [],
                    'load_balancer': [],
                    'external_ids': {}})
 
-        result = self.helper._ls_is_provider_network(tenant_ls)
+        result = self.helper._ls_is_provider_network(project_ls)
         self.assertFalse(result)
 
     def test__ls_is_provider_network_none(self):
@@ -4101,30 +4101,30 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         # Verify that db_set was NOT called (no ls_refs update)
         self.helper.ovn_nbdb_api.db_set.assert_not_called()
 
-    def test__update_lb_to_ls_association_allows_tenant_network(self):
+    def test__update_lb_to_ls_association_allows_project_network(self):
         self._update_lb_to_ls_association.stop()
         self._get_lb_to_ls_association_commands.stop()
 
-        # Create a tenant network without provider external_id
-        tenant_network = fakes.FakeOvsdbRow.create_one_ovsdb_row(
-            attrs={'name': 'neutron-tenant-net',
-                   'uuid': 'tenant-net-uuid',
+        # Create a project network without provider external_id
+        project_network = fakes.FakeOvsdbRow.create_one_ovsdb_row(
+            attrs={'name': 'neutron-project-net',
+                   'uuid': 'project-net-uuid',
                    'ports': [],
                    'load_balancer': [],
                    'external_ids': {}})
 
-        # Mock ls_get to return the tenant network
+        # Mock ls_get to return the project network
         (self.helper.ovn_nbdb_api.ls_get.return_value.
-            execute.return_value) = tenant_network
+            execute.return_value) = project_network
 
-        # Associate LB to the tenant network
+        # Associate LB to the project network
         self.helper._update_lb_to_ls_association(
-            self.ref_lb1, network_id='tenant-net-uuid',
+            self.ref_lb1, network_id='project-net-uuid',
             associate=True, update_ls_ref=True)
 
         # Verify that ls_lb_add WAS called (association happened)
         self.helper.ovn_nbdb_api.ls_lb_add.assert_called_once_with(
-            'tenant-net-uuid', self.ref_lb1.uuid, may_exist=True)
+            'project-net-uuid', self.ref_lb1.uuid, may_exist=True)
         # Verify that db_set WAS called (ls_refs updated)
         self.helper.ovn_nbdb_api.db_set.assert_called_once_with(
             'Load_Balancer', self.ref_lb1.uuid, mock.ANY)
