@@ -72,6 +72,8 @@
       - ^etc/.*$
       - ^releasenotes/.*$
     vars:
+      tempest_plugins:
+        - octavia-tempest-plugin
       devstack_localrc:
         Q_AGENT: ovn
         OVN_AGENT_EXTENSIONS: 'metadata'
@@ -81,7 +83,6 @@
         Q_ML2_PLUGIN_MECHANISM_DRIVERS: ovn
         Q_ML2_PLUGIN_TYPE_DRIVERS: local,flat,vlan,geneve
         Q_ML2_TENANT_NETWORK_TYPE: geneve
-        TEMPEST_PLUGINS: '/opt/stack/octavia-tempest-plugin'
         OCTAVIA_NODE: api
         OCTAVIA_TEMPEST_PLUGIN_CUSTOMIZE_IMAGE: true
         DISABLE_AMP_IMAGE_BUILD: true
