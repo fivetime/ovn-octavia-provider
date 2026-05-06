@@ -127,7 +127,6 @@
         q-l3: false
         ovn-northd: true
         ovn-controller: true
-        q-ovn-metadata-agent: false
         q-ovn-agent: true
         octavia: true
         o-api: true
