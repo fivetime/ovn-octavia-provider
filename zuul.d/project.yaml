@@ -15,8 +15,6 @@
         - ovn-octavia-provider-tempest-release
         - ovn-octavia-provider-tempest-master:
             voting: false
-        - kuryr-kubernetes-tempest-ovn-provider-ovn:
-            voting: false
         - devstack-tobiko-octavia:
             voting: true
             vars:
