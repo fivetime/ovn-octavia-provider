@@ -320,7 +320,7 @@ class OvnProviderHelper():
         # loadbalancers from the router into the provider network.
         # This will be already done for loadbalancer created with VIPs on
         # provider networks. And it should never be True there when the VIPs
-        # are on tenant networks.
+        # are on project networks.
         if info['is_gw_port']:
             return
 

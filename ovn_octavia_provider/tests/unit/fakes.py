@@ -158,7 +158,7 @@ class FakeSubnet():
             'name': 'subnet-name-' + fake_uuid,
             'network_id': 'network-id-' + fake_uuid,
             'cidr': '10.10.10.0/24',
-            'tenant_id': 'project-id-' + fake_uuid,
+            'project_id': 'project-id-' + fake_uuid,
             'enable_dhcp': True,
             'dns_nameservers': [],
             'allocation_pools': [],
@@ -313,7 +313,7 @@ class FakePort():
             'port_security_enabled': True,
             'security_groups': [],
             'status': 'ACTIVE',
-            'tenant_id': 'project-id-' + fake_uuid,
+            'project_id': 'project-id-' + fake_uuid,
         }
 
         # Overwrite default attributes.

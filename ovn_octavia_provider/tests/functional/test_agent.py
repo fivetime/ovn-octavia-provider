@@ -238,7 +238,7 @@ class TestOvnOctaviaProviderAgent(ovn_base.TestOvnOctaviaBase):
             self.context, filters={'id': [vip_port_id]})[0]
         self.l3_plugin.create_floatingip(
             self.context, {'floatingip': {
-                'tenant_id': self._project_id,
+                'project_id': self._project_id,
                 'floating_network_id': e1['network']['id'],
                 'subnet_id': None,
                 'floating_ip_address': '100.0.0.20',
@@ -253,10 +253,10 @@ class TestOvnOctaviaProviderAgent(ovn_base.TestOvnOctaviaBase):
                              lbs[0].get('vips'))
 
         provider_net = 'neutron-%s' % e1['network']['id']
-        tenant_net = 'neutron-%s' % lb_data['model'].vip_network_id
+        project_net = 'neutron-%s' % lb_data['model'].vip_network_id
         for ls in self.nb_api.tables['Logical_Switch'].rows.values():
-            if ls.name == tenant_net:
-                # Make sure that LB1 is added to tenant network
+            if ls.name == project_net:
+                # Make sure that LB1 is added to project network
                 self.assertIn(
                     lb_data['model'].loadbalancer_id,
                     [lb.name for lb in ls.load_balancer])
@@ -330,7 +330,7 @@ class TestOvnOctaviaProviderAgent(ovn_base.TestOvnOctaviaBase):
             self.context, filters={'id': [addi_vip_port_id]})[0]
         self.l3_plugin.create_floatingip(
             self.context, {'floatingip': {
-                'tenant_id': self._project_id,
+                'project_id': self._project_id,
                 'floating_network_id': e1['network']['id'],
                 'subnet_id': None,
                 'floating_ip_address': '100.0.0.20',
@@ -347,10 +347,10 @@ class TestOvnOctaviaProviderAgent(ovn_base.TestOvnOctaviaBase):
                              lbs[0].get('vips'))
 
         provider_net = 'neutron-%s' % e1['network']['id']
-        tenant_net = 'neutron-%s' % lb_data['model'].vip_network_id
+        project_net = 'neutron-%s' % lb_data['model'].vip_network_id
         for ls in self.nb_api.tables['Logical_Switch'].rows.values():
-            if ls.name == tenant_net:
-                # Make sure that LB1 is added to tenant network
+            if ls.name == project_net:
+                # Make sure that LB1 is added to project network
                 self.assertIn(
                     lb_data['model'].loadbalancer_id,
                     [lb.name for lb in ls.load_balancer])
