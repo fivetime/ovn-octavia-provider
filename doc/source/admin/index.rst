@@ -6,3 +6,4 @@ Administration Guide
    :maxdepth: 1
 
    driver
+   ovn-db-sync-plugin

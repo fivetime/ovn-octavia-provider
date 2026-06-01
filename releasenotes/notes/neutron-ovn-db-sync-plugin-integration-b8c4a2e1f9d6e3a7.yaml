@@ -1,0 +1,66 @@
+---
+features:
+  - |
+    The OVN Octavia provider now includes a synchronization plugin that
+    integrates with Neutron's ``neutron-ovn-db-sync-util`` CLI tool.
+    This allows operators to synchronize both Neutron and Octavia resources
+    with the OVN Northbound database in a single operation.
+
+    The plugin is automatically registered via the ``neutron.ovn.db_sync``
+    entry point when ``ovn-octavia-provider`` is installed. When running
+    ``neutron-ovn-db-sync-util`` in REPAIR mode, Octavia load balancers
+    using the OVN provider will be synchronized alongside Neutron resources.
+
+    Example usage::
+
+        neutron-ovn-db-sync-util \
+            --config-file /etc/neutron/neutron.conf \
+            --config-file /etc/neutron/plugins/ml2/ml2_conf.ini \
+            --ovn-neutron_sync_mode repair
+
+    Note: The Octavia configuration is loaded automatically from
+    /etc/octavia/octavia.conf and should NOT be passed as --config-file.
+
+    The plugin can also be used to synchronize only Octavia resources
+    by using the ``--sync_plugin octavia_ovn_sync`` option::
+
+        neutron-ovn-db-sync-util \
+            --config-file /etc/neutron/neutron.conf \
+            --config-file /etc/neutron/plugins/ml2/ml2_conf.ini \
+            --sync_plugin octavia_ovn_sync \
+            --ovn-neutron_sync_mode repair
+
+    The standalone ``octavia-ovn-db-sync-util`` command remains available
+    for compatibility.
+
+    Benefits of the integrated approach:
+
+    * Single command to sync both Neutron and Octavia resources
+    * Ability to sync only Octavia with ``--sync_plugin`` option
+    * Shared OVN Northbound database connection
+    * Consistent sync mode across all resources
+    * Reduced operational complexity
+
+upgrade:
+  - |
+    The Octavia OVN synchronization plugin requires:
+
+    * Neutron with support for the ``neutron.ovn.db_sync`` entry point
+      system (version that includes patch 970407)
+    * neutron-lib with ``BaseOvnDbSynchronizer`` class
+      (version that includes patch 970267)
+
+    If using older versions of Neutron or neutron-lib, the plugin will
+    fail to load and the standalone ``octavia-ovn-db-sync-util`` command
+    should be used instead.
+
+other:
+  - |
+    The Octavia OVN synchronization plugin does not support LOG mode
+    (read-only verification). When ``neutron-ovn-db-sync-util`` is run
+    in LOG mode, the Octavia plugin will skip synchronization and log
+    a warning. Only REPAIR and MIGRATE modes are supported.
+
+    For operators who need to verify Octavia synchronization without
+    making changes, the standalone ``octavia-ovn-db-sync-util`` tool
+    can be used, though it also operates in repair mode only.
