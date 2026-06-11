@@ -12,3 +12,4 @@ WebTest>=2.0.27 # MIT
 testtools>=2.2.0 # MIT
 PyMySQL>=0.7.6 # MIT License
 neutron>=23.0.0.0b3 # Apache-2.0
+pyroute2>=0.7.3;sys_platform!='win32'  # Apache-2.0 (+ dual licensed GPL2)
