@@ -2868,7 +2868,8 @@ class OvnProviderHelper():
                 self._update_hm_member(ovn_lb,
                                        pool_key,
                                        member.get(constants.ADDRESS),
-                                       delete=True)
+                                       delete=True,
+                                       member_id=member.get(constants.ID))
 
             commands = []
             existing_members.remove(member_info)
@@ -3033,7 +3034,8 @@ class OvnProviderHelper():
                     self._update_hm_member(
                         ovn_lb, pool_key,
                         member.get(constants.ADDRESS),
-                        delete=delete)
+                        delete=delete,
+                        member_id=member.get(constants.ID))
 
         status = self._get_current_operating_statuses(ovn_lb)
         status[constants.MEMBERS] = member_status
@@ -3762,7 +3764,8 @@ class OvnProviderHelper():
             port_name,
             src_ip,
             pool_key,
-            delete=False):
+            delete=False,
+            member_id=None):
         # ip_port_mappings:${MEMBER_IP}=${LSP_NAME_MEMBER}:${HEALTH_SRC}
         # where:
         #  MEMBER_IP: IP of member_lsp
@@ -3770,14 +3773,19 @@ class OvnProviderHelper():
         #  HEALTH_SRC: source IP of hm_port
 
         if delete:
-            # Before removing a member from ip_port_mappings,
-            # make sure no other
-            # pool uses the same member.
+            # Before removing a member from ip_port_mappings, make sure no
+            # other member uses the same address. The mapping is per address,
+            # so a member of the same pool on another port loses its monitor
+            # too; only the leaving member itself can be skipped, when known.
             other_members = []
             for k, v in ovn_lb.external_ids.items():
-                if ovn_const.LB_EXT_IDS_POOL_PREFIX in k and k != pool_key:
-                    other_members.extend(self._extract_member_info(
-                        ovn_lb.external_ids[k]))
+                if ovn_const.LB_EXT_IDS_POOL_PREFIX not in k:
+                    continue
+                if k == pool_key and member_id is None:
+                    continue
+                other_members.extend(
+                    item for item in self._extract_member_info(v)
+                    if item[3] != member_id)
             member_statuses = ovn_lb.external_ids.get(
                 ovn_const.OVN_MEMBER_STATUS_KEY)
             try:
@@ -3787,13 +3795,16 @@ class OvnProviderHelper():
                           str(member_statuses))
                 member_statuses = {}
             execute_delete = True
-            for member_id in [item[3] for item in other_members
-                              if item[0] == backend_ip]:
-                if member_statuses.get(member_id, '') != constants.NO_MONITOR:
+            for other_id in [item[3] for item in other_members
+                             if item[0] == backend_ip]:
+                # A disabled member is not monitored; enabling it adds the
+                # mapping back.
+                if member_statuses.get(other_id, '') not in (
+                        constants.NO_MONITOR, constants.OFFLINE):
                     execute_delete = False
                     LOG.debug(
                         f"Backend {backend_ip} still in use by member"
-                        f" {member_id}, "
+                        f" {other_id}, "
                         f"so it won't be removed"
                     )
                     break
@@ -3848,7 +3859,8 @@ class OvnProviderHelper():
                     self.ovn_nbdb_api.lb_del_ip_port_mapping(
                         ovn_lb.uuid, mb_ip).execute()
 
-    def _update_hm_member(self, ovn_lb, pool_key, backend_ip, delete=False):
+    def _update_hm_member(self, ovn_lb, pool_key, backend_ip, delete=False,
+                          member_id=None):
         # Update just the backend_ip member
         for mb_ip, mb_port, mb_subnet, mb_id in self._extract_member_info(
                 ovn_lb.external_ids[pool_key]):
@@ -3894,7 +3906,8 @@ class OvnProviderHelper():
                                               member_lsp.name,
                                               hm_source_ip,
                                               pool_key,
-                                              delete)
+                                              delete,
+                                              member_id=member_id)
                 return constants.ONLINE
 
         # NOTE(froyo): If the backend is not located
