@@ -1,0 +1,10 @@
+---
+fixes:
+  - |
+    A health check verdict is no longer overwritten by the operation that
+    caused it. Creating or enabling a member, or creating a health monitor,
+    reports the members ``ONLINE`` when the operation finishes, and on OVN
+    versions that create the ``Service_Monitor`` already ``offline`` the
+    agent could report a down member ``ERROR`` before that, so it stayed
+    ``ONLINE``. Health check events of a load balancer are now applied once
+    it is no longer ``PENDING_*``, waiting at most 60 seconds.

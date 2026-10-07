@@ -48,6 +48,9 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         mock.patch.object(self.helper, '_update_status_to_octavia').start()
         self.octavia_driver_lib = mock.patch.object(
             self.helper, '_octavia_driver_lib').start()
+        self.real_helper_lb_in_flight = self.helper._lb_in_flight
+        self.lb_in_flight = mock.patch.object(
+            self.helper, '_lb_in_flight', return_value=False).start()
         self.listener = {'id': self.listener_id,
                          'loadbalancer_id': self.loadbalancer_id,
                          'protocol': 'TCP',
@@ -7442,6 +7445,73 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
             '10.0.0.1', '80', ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE,
             delete=True))
         self.helper.ovn_nbdb_api.db_set.assert_not_called()
+
+    @mock.patch.object(ovn_helper.OvnProviderHelper,
+                       '_start_hm_release_timer')
+    def test_hm_update_event_waits_for_the_operation_in_flight(
+            self, start_timer):
+        # member_create reports the member ONLINE when it finishes; a verdict
+        # given before that, as for a member created down, was overwritten.
+        member = uuidutils.generate_uuid()
+        self._set_hm_lb_members([(member, '10.0.0.1', '80')],
+                                {member: constants.ONLINE})
+        self.lb_in_flight.return_value = True
+        self.assertIsNone(self._hm_event(
+            '10.0.0.1', '80', ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE))
+        start_timer.assert_called_once_with(self.ovn_hm_lb.name, mock.ANY)
+        # Events that follow are held behind it even once it settled.
+        self.lb_in_flight.return_value = False
+        self.assertIsNone(self._hm_event(
+            '10.0.0.1', '80', ovn_const.HM_EVENT_MEMBER_PORT_ONLINE))
+        self.assertIsNone(self._hm_event(
+            '10.0.0.1', '80', ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE))
+        self.helper.ovn_nbdb_api.db_set.assert_not_called()
+
+        self.assertIsNotNone(self.helper.hm_release_events(
+            {'lb_id': self.ovn_hm_lb.name}))
+        written = [jsonutils.loads(
+            c.args[2][1][ovn_const.OVN_MEMBER_STATUS_KEY])[member]
+            for c in self.helper.ovn_nbdb_api.db_set.call_args_list]
+        self.assertEqual(
+            [constants.ERROR, constants.ONLINE, constants.ERROR], written)
+        self.assertEqual({}, self.helper._held_hm_events)
+
+    @mock.patch.object(ovn_helper.OvnProviderHelper,
+                       '_start_hm_release_timer')
+    def test_release_hm_events_when_settled(self, start_timer):
+        self.lb_in_flight.return_value = True
+        self.helper._release_hm_events_when_settled('lb', 0)
+        self.mock_add_request.assert_called_once_with(
+            {'type': ovn_const.REQ_TYPE_HM_RELEASE_EVENTS,
+             'info': {'lb_id': 'lb'}})
+        start_timer.assert_not_called()
+
+        self.mock_add_request.reset_mock()
+        started = ovn_helper.time.monotonic()
+        self.helper._release_hm_events_when_settled('lb', started)
+        start_timer.assert_called_once_with('lb', started)
+        self.mock_add_request.assert_not_called()
+
+        self.lb_in_flight.return_value = False
+        self.helper._release_hm_events_when_settled('lb', started)
+        self.mock_add_request.assert_called_once_with(
+            {'type': ovn_const.REQ_TYPE_HM_RELEASE_EVENTS,
+             'info': {'lb_id': 'lb'}})
+
+    @mock.patch.object(clients, 'get_octavia_client')
+    def test_lb_in_flight(self, get_client):
+        get_lb = get_client.return_value.get_load_balancer
+        for provisioning_status, expected in (
+                (constants.PENDING_UPDATE, True),
+                (constants.PENDING_CREATE, True),
+                (constants.ACTIVE, False),
+                (constants.ERROR, False)):
+            get_lb.return_value.provisioning_status = provisioning_status
+            self.assertEqual(expected, self.real_helper_lb_in_flight('lb'))
+        for error in (openstack.exceptions.ResourceNotFound,
+                      exceptions.DriverError):
+            get_lb.side_effect = error
+            self.assertFalse(self.real_helper_lb_in_flight('lb'))
 
     @mock.patch.object(ovn_helper.OvnProviderHelper, '_frame_vip_ips')
     def test_refresh_lb_vips_returns_empty_when_synced(self,

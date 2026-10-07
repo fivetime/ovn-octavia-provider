@@ -17,6 +17,7 @@ import copy
 import queue
 import re
 import threading
+import time
 
 import netaddr
 from neutron_lib import constants as n_const
@@ -57,6 +58,9 @@ class OvnProviderHelper():
         self.helper_thread = threading.Thread(target=self.request_handler)
         self.helper_thread.daemon = True
         self._octavia_driver_lib = o_driver_lib.DriverLibrary()
+        # Health check events held per load balancer ID, touched only by the
+        # request handler thread.
+        self._held_hm_events = {}
         ovsdb_monitor.check_and_set_ssl_files('OVN_Northbound')
         self._init_lb_actions()
 
@@ -89,6 +93,7 @@ class OvnProviderHelper():
             ovn_const.REQ_TYPE_HM_UPDATE: self.hm_update,
             ovn_const.REQ_TYPE_HM_DELETE: self.hm_delete,
             ovn_const.REQ_TYPE_HM_UPDATE_EVENT: self.hm_update_event,
+            ovn_const.REQ_TYPE_HM_RELEASE_EVENTS: self.hm_release_events,
         }
 
     @staticmethod
@@ -4420,49 +4425,110 @@ class OvnProviderHelper():
         return status
 
     def hm_update_event(self, info):
-        ovn_lbs = info['ovn_lbs']
         statuses = []
+        for ovn_lb in info['ovn_lbs']:
+            if self._hold_hm_event(ovn_lb, info):
+                continue
+            status = self._hm_update_event_lb(ovn_lb, info)
+            if status:
+                statuses.append(status)
+        return self._merge_statuses(statuses)
 
-        for ovn_lb in ovn_lbs:
-            # Lookup member
-            member_id = None
-            for k, v in ovn_lb.external_ids.items():
-                if ovn_const.LB_EXT_IDS_POOL_PREFIX not in k:
+    def hm_release_events(self, info):
+        statuses = []
+        for ovn_lb, event in self._held_hm_events.pop(info['lb_id'], []):
+            status = self._hm_update_event_lb(ovn_lb, event)
+            if status:
+                statuses.append(status)
+        return self._merge_statuses(statuses)
+
+    def _hold_hm_event(self, ovn_lb, info):
+        # NOTE: an operation on the load balancer reports the member statuses
+        # it assumed when it finishes, which would overwrite a verdict the
+        # health check gave meanwhile, e.g. for a member created already
+        # down. Hold the events, in order, until the operation reported.
+        lb_id = ovn_lb.name
+        held = self._held_hm_events.get(lb_id)
+        if held is not None:
+            held.append((ovn_lb, info))
+            return True
+        if not self._lb_in_flight(lb_id):
+            return False
+        self._held_hm_events[lb_id] = [(ovn_lb, info)]
+        self._start_hm_release_timer(lb_id, time.monotonic())
+        return True
+
+    def _start_hm_release_timer(self, lb_id, started):
+        timer = threading.Timer(ovn_const.HM_EVENT_HOLD_INTERVAL,
+                                self._release_hm_events_when_settled,
+                                args=(lb_id, started))
+        timer.daemon = True
+        timer.start()
+
+    def _release_hm_events_when_settled(self, lb_id, started):
+        if (self._lb_in_flight(lb_id) and
+                time.monotonic() - started < ovn_const.HM_EVENT_HOLD_MAX):
+            self._start_hm_release_timer(lb_id, started)
+            return
+        self.add_request({'type': ovn_const.REQ_TYPE_HM_RELEASE_EVENTS,
+                          'info': {'lb_id': lb_id}})
+
+    def _lb_in_flight(self, lb_id):
+        try:
+            lb = clients.get_octavia_client().get_load_balancer(lb_id)
+        except openstack.exceptions.ResourceNotFound:
+            return False
+        except Exception:
+            LOG.warning("Could not read the provisioning status of load "
+                        "balancer %s, applying its health check events "
+                        "now", lb_id, exc_info=True)
+            return False
+        return lb.provisioning_status in (constants.PENDING_CREATE,
+                                          constants.PENDING_UPDATE,
+                                          constants.PENDING_DELETE)
+
+    def _hm_update_event_lb(self, ovn_lb, info):
+        # Lookup member
+        member_id = None
+        for k, v in ovn_lb.external_ids.items():
+            if ovn_const.LB_EXT_IDS_POOL_PREFIX not in k:
+                continue
+            for (
+                mb_ip, mb_port, mb_subnet, mb_id,
+            ) in self._extract_member_info(v):
+                if info['ip'] != mb_ip:
                     continue
-                for (
-                    mb_ip, mb_port, mb_subnet, mb_id,
-                ) in self._extract_member_info(v):
-                    if info['ip'] != mb_ip:
-                        continue
-                    if info['port'] != mb_port:
-                        continue
-                    member_id = mb_id
-                    break
+                if info['port'] != mb_port:
+                    continue
+                member_id = mb_id
+                break
 
-                # found it in inner loop
-                if member_id:
-                    break
+            # found it in inner loop
+            if member_id:
+                break
 
-            if not member_id:
-                LOG.warning('Member for event not found, info: %s', info)
-            else:
-                if info['delete']:
-                    # NOTE: OFFLINE means administratively disabled and takes
-                    # the member out of the vips, which would remove its
-                    # monitor for good. A monitor that went away is ERROR.
-                    if self._is_member_offline(ovn_lb, member_id):
-                        continue
-                    member_status = constants.ERROR
-                elif info['status'] == ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE:
-                    member_status = constants.ERROR
-                else:
-                    member_status = constants.ONLINE
+        if not member_id:
+            LOG.warning('Member for event not found, info: %s', info)
+            return None
+        if info['delete']:
+            # NOTE: OFFLINE means administratively disabled and takes
+            # the member out of the vips, which would remove its
+            # monitor for good. A monitor that went away is ERROR.
+            if self._is_member_offline(ovn_lb, member_id):
+                return None
+            member_status = constants.ERROR
+        elif info['status'] == ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE:
+            member_status = constants.ERROR
+        else:
+            member_status = constants.ONLINE
 
-                self._update_external_ids_member_status(ovn_lb,
-                                                        [(member_id,
-                                                          member_status)])
-                statuses.append(self._get_current_operating_statuses(ovn_lb))
+        self._update_external_ids_member_status(ovn_lb,
+                                                [(member_id,
+                                                  member_status)])
+        return self._get_current_operating_statuses(ovn_lb)
 
+    @staticmethod
+    def _merge_statuses(statuses):
         if not statuses:
             return
 

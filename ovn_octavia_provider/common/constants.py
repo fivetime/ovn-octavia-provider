@@ -88,6 +88,7 @@ REQ_TYPE_HM_CREATE = 'hm_create'
 REQ_TYPE_HM_UPDATE = 'hm_update'
 REQ_TYPE_HM_DELETE = 'hm_delete'
 REQ_TYPE_HM_UPDATE_EVENT = 'hm_update_event'
+REQ_TYPE_HM_RELEASE_EVENTS = 'hm_release_events'
 
 REQ_TYPE_EXIT = 'exit'
 
@@ -132,6 +133,11 @@ LB_SELECTION_FIELDS_MAP = {
 # HM events status
 HM_EVENT_MEMBER_PORT_ONLINE = ['online']
 HM_EVENT_MEMBER_PORT_OFFLINE = ['offline']
+
+# Seconds between checks, and at most, that the health check events of a
+# load balancer are held while an operation on it has not reported back.
+HM_EVENT_HOLD_INTERVAL = 1
+HM_EVENT_HOLD_MAX = 60
 
 # max timeout for request
 MAX_TIMEOUT_REQUEST = 5
