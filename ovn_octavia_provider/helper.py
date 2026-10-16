@@ -4386,7 +4386,8 @@ class OvnProviderHelper():
         """What the load balancer's VIPs can deliver traffic to.
 
         Returns (networks, switches): the networks and static route
-        prefixes of every router the load balancer is on, and the logical
+        prefixes, bar default routes, of every router the load balancer is
+        on, and the logical
         switches holding its VIP ports. None when neither can be found,
         which says nothing either way.
 
@@ -4407,7 +4408,11 @@ class OvnProviderHelper():
                 for cidr in lrp.networks:
                     networks.append(netaddr.IPNetwork(cidr))
             for route in getattr(lr, 'static_routes', []) or []:
-                networks.append(netaddr.IPNetwork(route.ip_prefix))
+                prefix = netaddr.IPNetwork(route.ip_prefix)
+                # A default route leads out of the gateway, which matches
+                # every member and so would vouch for none of them.
+                if prefix.prefixlen:
+                    networks.append(prefix)
         vip_ports = {ovn_lb.external_ids.get(
             ovn_const.LB_EXT_IDS_VIP_PORT_ID_KEY)}
         additional = ovn_lb.external_ids.get(

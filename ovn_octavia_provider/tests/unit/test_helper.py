@@ -9154,6 +9154,19 @@ class TestUnreachableMembers(ovn_base.TestOvnOctaviaBase):
                       routes=['192.168.242.0/24'])
         self.assertEqual(constants.ONLINE, self.reported())
 
+    def test_the_gateways_default_route_does_not_count(self):
+        # Most tenant routers have one; it would make every member reachable.
+        self.topology(router_networks=['192.168.241.1/24', '172.24.4.10/24'],
+                      routes=['0.0.0.0/0', '::/0'])
+        self.assertEqual(constants.ERROR, self.reported())
+
+    def test_a_member_on_the_gateways_network_counts(self):
+        self.lb.external_ids['pool_%s' % self.POOL] = (
+            'member_%s_172.24.4.20:80_subnet-b' % self.MEMBER_ID)
+        self.topology(router_networks=['192.168.241.1/24', '172.24.4.10/24'],
+                      routes=['0.0.0.0/0'])
+        self.assertEqual(constants.ONLINE, self.reported())
+
     def test_a_member_on_the_vips_own_switch_needs_no_router(self):
         self.vip_switch.ports.append(
             _Row(name='m', addresses=['fa:16:3e:00:00:02 %s' % self.MEMBER]))
