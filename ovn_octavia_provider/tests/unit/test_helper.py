@@ -13,6 +13,7 @@
 #
 import collections
 import copy
+import queue
 from unittest import mock
 
 from neutron_lib import constants as n_const
@@ -51,6 +52,9 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         self.real_helper_lb_in_flight = self.helper._lb_in_flight
         self.lb_in_flight = mock.patch.object(
             self.helper, '_lb_in_flight', return_value=False).start()
+        # Reachability has its own tests below; the mocked NB has no topology.
+        mock.patch.object(self.helper, '_vip_reach',
+                          return_value=None).start()
         self.listener = {'id': self.listener_id,
                          'loadbalancer_id': self.loadbalancer_id,
                          'protocol': 'TCP',
@@ -7447,9 +7451,9 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         self.helper.ovn_nbdb_api.db_set.assert_not_called()
 
     @mock.patch.object(ovn_helper.OvnProviderHelper,
-                       '_start_hm_release_timer')
+                       '_ensure_hm_release_thread', return_value=True)
     def test_hm_update_event_waits_for_the_operation_in_flight(
-            self, start_timer):
+            self, ensure_thread):
         # member_create reports the member ONLINE when it finishes; a verdict
         # given before that, as for a member created down, was overwritten.
         member = uuidutils.generate_uuid()
@@ -7458,7 +7462,8 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         self.lb_in_flight.return_value = True
         self.assertIsNone(self._hm_event(
             '10.0.0.1', '80', ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE))
-        start_timer.assert_called_once_with(self.ovn_hm_lb.name, mock.ANY)
+        ensure_thread.assert_called_once_with()
+        self.assertEqual([self.ovn_hm_lb.name], list(self.helper._hm_holds))
         # Events that follow are held behind it even once it settled.
         self.lb_in_flight.return_value = False
         self.assertIsNone(self._hm_event(
@@ -7477,26 +7482,70 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         self.assertEqual({}, self.helper._held_hm_events)
 
     @mock.patch.object(ovn_helper.OvnProviderHelper,
-                       '_start_hm_release_timer')
-    def test_release_hm_events_when_settled(self, start_timer):
+                       '_ensure_hm_release_thread', return_value=False)
+    def test_hm_update_event_applied_without_a_release_thread(
+            self, ensure_thread):
+        member = uuidutils.generate_uuid()
+        self._set_hm_lb_members([(member, '10.0.0.1', '80')],
+                                {member: constants.ONLINE})
         self.lb_in_flight.return_value = True
-        self.helper._release_hm_events_when_settled('lb', 0)
-        self.mock_add_request.assert_called_once_with(
-            {'type': ovn_const.REQ_TYPE_HM_RELEASE_EVENTS,
-             'info': {'lb_id': 'lb'}})
-        start_timer.assert_not_called()
+        self.assertIsNotNone(self._hm_event(
+            '10.0.0.1', '80', ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE))
+        self.assertEqual({}, self.helper._held_hm_events)
+        self.assertEqual({}, self.helper._hm_holds)
 
-        self.mock_add_request.reset_mock()
-        started = ovn_helper.time.monotonic()
-        self.helper._release_hm_events_when_settled('lb', started)
-        start_timer.assert_called_once_with('lb', started)
-        self.mock_add_request.assert_not_called()
+    def test_release_settled_hm_holds(self):
+        now = ovn_helper.time.monotonic()
+        self.helper._hm_holds = {'pending': now, 'capped': 0, 'done': now}
+        self.lb_in_flight.side_effect = lambda lb_id: lb_id != 'done'
+        self.helper._release_settled_hm_holds()
+        self.assertEqual(
+            [mock.call({'type': ovn_const.REQ_TYPE_HM_RELEASE_EVENTS,
+                        'info': {'lb_id': lb_id}})
+             for lb_id in ('capped', 'done')],
+            self.mock_add_request.call_args_list)
+        self.assertEqual({'pending': now}, self.helper._hm_holds)
+        # The cap needs no status read.
+        self.assertNotIn(mock.call('capped'),
+                         self.lb_in_flight.call_args_list)
 
-        self.lb_in_flight.return_value = False
-        self.helper._release_hm_events_when_settled('lb', started)
-        self.mock_add_request.assert_called_once_with(
-            {'type': ovn_const.REQ_TYPE_HM_RELEASE_EVENTS,
-             'info': {'lb_id': 'lb'}})
+    def test_release_settled_hm_holds_keeps_a_newer_hold(self):
+        def renew(req):
+            self.helper._hm_holds['lb'] = 1.0
+        self.helper._hm_holds = {'lb': 0}
+        self.mock_add_request.side_effect = renew
+        self.helper._release_settled_hm_holds()
+        self.assertEqual({'lb': 1.0}, self.helper._hm_holds)
+
+    def test_release_settled_hm_holds_retries_a_failed_release(self):
+        self.helper._hm_holds = {'lb': 0}
+        self.mock_add_request.side_effect = queue.Full
+        self.assertRaises(queue.Full, self.helper._release_settled_hm_holds)
+        self.assertEqual({'lb': 0}, self.helper._hm_holds)
+
+    @mock.patch.object(ovn_helper.time, 'sleep')
+    @mock.patch.object(ovn_helper.OvnProviderHelper,
+                       '_release_settled_hm_holds')
+    def test_hm_release_loop_survives_errors(self, release, sleep):
+        sleep.side_effect = [None, None, StopIteration]
+        release.side_effect = [RuntimeError, None]
+        self.assertRaises(StopIteration, self.helper._hm_release_loop)
+        self.assertEqual(2, release.call_count)
+
+    @mock.patch.object(ovn_helper.threading, 'Thread')
+    def test_ensure_hm_release_thread(self, thread):
+        self.assertTrue(self.helper._ensure_hm_release_thread())
+        thread.return_value.start.assert_called_once_with()
+        thread.return_value.is_alive.return_value = True
+        self.assertTrue(self.helper._ensure_hm_release_thread())
+        self.assertEqual(1, thread.call_count)
+        # A thread that died is replaced.
+        thread.return_value.is_alive.return_value = False
+        self.assertTrue(self.helper._ensure_hm_release_thread())
+        self.assertEqual(2, thread.call_count)
+        thread.return_value.start.side_effect = RuntimeError
+        self.helper._hm_release_thread = None
+        self.assertFalse(self.helper._ensure_hm_release_thread())
 
     @mock.patch.object(clients, 'get_octavia_client')
     def test_lb_in_flight(self, get_client):
@@ -9011,3 +9060,294 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         listener_dict_none = {'admin_state_up': None}
         result = self.helper._get_listener_admin_state(listener_dict_none)
         self.assertIsNone(result)
+
+
+class _Row:
+    # Hashable by identity, as IDL rows are: the handlers put them in sets.
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class TestUnreachableMembers(ovn_base.TestOvnOctaviaBase):
+    """A member the VIP cannot route to is not ONLINE.
+
+    The health check probes from a port on the member's own subnet, so a
+    member subnet detached from the VIP's router kept answering it while
+    every request to the VIP timed out (measured on the production cluster:
+    ONLINE throughout, curl rc=28).
+    """
+
+    VIP_PORT = 'vip-port'
+    MEMBER = '192.168.242.141'
+    POOL = 'pool-1'
+    MEMBER_ID = 'member-1'
+
+    def setUp(self):
+        super().setUp()
+        ovn_conf.register_opts()
+        self.helper = ovn_helper.OvnProviderHelper()
+        mock.patch.object(self.helper, '_update_status_to_octavia').start()
+        self.driver_lib = mock.patch.object(
+            self.helper, '_octavia_driver_lib').start()
+        self.nb = mock.patch.object(self.helper, 'ovn_nbdb_api').start()
+        self.nb.lookup.side_effect = self.lookup
+        # The whole tables are never read.
+        type(self.nb).tables = mock.PropertyMock(
+            side_effect=AssertionError('scanned a whole table'))
+        mock.patch.object(ovn_helper.OvnProviderHelper,
+                          'add_request').start()
+        self.addCleanup(mock.patch.stopall)
+        self.lb = _Row(
+            uuid=uuidutils.generate_uuid(), name='lb-1',
+            external_ids={
+                ovn_const.LB_EXT_IDS_VIP_PORT_ID_KEY: self.VIP_PORT,
+                ovn_const.LB_EXT_IDS_LR_REF_KEY: 'neutron-r',
+                ovn_const.LB_EXT_IDS_LS_REFS_KEY: jsonutils.dumps(
+                    {'neutron-net-a': 1, 'neutron-net-b': 1}),
+                'listener_l-1': '80:pool_%s' % self.POOL,
+                'pool_%s' % self.POOL: 'member_%s_%s:80_subnet-b' % (
+                    self.MEMBER_ID, self.MEMBER),
+                ovn_const.OVN_MEMBER_STATUS_KEY: jsonutils.dumps(
+                    {self.MEMBER_ID: constants.ONLINE})})
+        self.vip_switch = _Row(uuid='ls-a', ports=[
+            _Row(name=self.VIP_PORT, addresses=['fa:16:3e:00:00:01 '
+                                                '192.168.241.10'])])
+        self.rows = {}
+
+    def lookup(self, table, name):
+        try:
+            return self.rows[table][name]
+        except KeyError:
+            raise idlutils.RowNotFound(table=table, col='name', match=name)
+
+    def topology(self, router_networks=(), routes=(), on_router=True,
+                 vip_switch=True):
+        router = _Row(
+            load_balancer=[self.lb] if on_router else [],
+            ports=[_Row(networks=list(router_networks))],
+            static_routes=[_Row(ip_prefix=prefix) for prefix in routes])
+        self.rows = {
+            'Logical_Router': {'neutron-r': router},
+            'Logical_Switch_Port': {self.VIP_PORT: _Row(external_ids={
+                ovn_const.OVN_NETWORK_NAME_EXT_ID_KEY: 'neutron-net-a'})},
+            'Logical_Switch': (
+                {'neutron-net-a': self.vip_switch} if vip_switch else {})}
+
+    def reported(self):
+        statuses = jsonutils.loads(
+            self.lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY])
+        return self.helper._withhold_unreachable(self.lb, statuses)[
+            self.MEMBER_ID]
+
+    def test_a_member_subnet_on_the_vips_router_stays_online(self):
+        self.topology(router_networks=['192.168.241.1/24',
+                                       '192.168.242.1/24'])
+        self.assertEqual(constants.ONLINE, self.reported())
+
+    def test_a_member_subnet_off_the_vips_router_is_error(self):
+        # The production shape: network B detached from the router.
+        self.topology(router_networks=['192.168.241.1/24'])
+        self.assertEqual(constants.ERROR, self.reported())
+
+    def test_a_static_route_to_the_member_counts(self):
+        self.topology(router_networks=['192.168.241.1/24'],
+                      routes=['192.168.242.0/24'])
+        self.assertEqual(constants.ONLINE, self.reported())
+
+    def test_a_member_on_the_vips_own_switch_needs_no_router(self):
+        self.vip_switch.ports.append(
+            _Row(name='m', addresses=['fa:16:3e:00:00:02 %s' % self.MEMBER]))
+        self.topology(on_router=False)
+        self.assertEqual(constants.ONLINE, self.reported())
+
+    def test_a_router_the_lb_has_left_does_not_count(self):
+        # lr_ref is only a hint; the router itself says what is on it.
+        self.topology(router_networks=['192.168.242.1/24'], on_router=False)
+        self.assertEqual(constants.ERROR, self.reported())
+
+    def test_no_topology_found_changes_nothing(self):
+        # Nothing to judge from is not evidence of a fault.
+        self.topology(on_router=False, vip_switch=False)
+        self.assertEqual(constants.ONLINE, self.reported())
+
+    def test_a_member_that_is_not_online_is_left_alone(self):
+        # NO_MONITOR claims nothing, and ERROR is already ERROR.
+        self.topology(router_networks=['192.168.241.1/24'])
+        statuses = {self.MEMBER_ID: constants.NO_MONITOR}
+        self.assertEqual(
+            constants.NO_MONITOR,
+            self.helper._withhold_unreachable(self.lb, statuses)[
+                self.MEMBER_ID])
+
+    def test_the_stored_status_stays_the_probes(self):
+        self.topology(router_networks=['192.168.241.1/24'])
+        self.reported()
+        self.assertEqual(
+            {self.MEMBER_ID: constants.ONLINE},
+            jsonutils.loads(
+                self.lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY]))
+
+    def test_ipv6_members_are_judged_too(self):
+        member = '2001:db8:2::5'
+        self.lb.external_ids['pool_%s' % self.POOL] = (
+            'member_%s_%s:80_subnet-b' % (self.MEMBER_ID, member))
+        self.topology(router_networks=['2001:db8:1::1/64'])
+        self.assertEqual(constants.ERROR, self.reported())
+        self.topology(router_networks=['2001:db8:1::1/64',
+                                       '2001:db8:2::1/64'])
+        self.assertEqual(constants.ONLINE, self.reported())
+
+    def _report(self):
+        self.driver_lib.get_loadbalancer.return_value = mock.Mock(
+            admin_state_up=True,
+            pools=[{'pool_id': self.POOL, 'admin_state_up': True}],
+            listeners=[{'listener_id': 'l-1', 'admin_state_up': True}])
+        return self.helper._get_current_operating_statuses(self.lb)
+
+    def test_the_report_carries_it_up_to_the_pool(self):
+        self.topology(router_networks=['192.168.241.1/24'])
+        status = self._report()
+        self.assertEqual(
+            [constants.ERROR],
+            [m[constants.OPERATING_STATUS] for m in status[constants.MEMBERS]])
+        self.assertEqual(
+            [constants.ERROR],
+            [p[constants.OPERATING_STATUS] for p in status[constants.POOLS]])
+
+    def test_a_router_interface_removed_re_reports(self):
+        # No member changed, so no health check event would ever say so.
+        self.topology(router_networks=['192.168.241.1/24'])
+        network = _Row(load_balancer=[self.lb], name='neutron-net-b',
+                       uuid='ls-b')
+        router = _Row(load_balancer=[], uuid='lr-1')
+        with mock.patch.object(self.helper,
+                               '_update_lb_to_lr_association'):
+            status = self.helper.lb_delete_lrp_assoc(
+                {'network': network, 'router': router})
+        self.assertEqual(
+            [constants.ERROR],
+            [m[constants.OPERATING_STATUS] for m in status[constants.MEMBERS]])
+
+    def test_a_router_interface_added_re_reports(self):
+        self.topology(router_networks=['192.168.241.1/24',
+                                       '192.168.242.1/24'])
+        network = _Row(load_balancer=[self.lb], name='neutron-net-b',
+                       uuid='ls-b')
+        router = _Row(load_balancer=[self.lb], uuid='lr-1')
+        status = self.helper.lb_create_lrp_assoc(
+            {'network': network, 'router': router, 'is_gw_port': False})
+        self.assertEqual(
+            [constants.ONLINE],
+            [m[constants.OPERATING_STATUS] for m in status[constants.MEMBERS]])
+
+    def test_a_load_balancer_without_a_monitor_is_not_re_reported(self):
+        self.lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY] = '{}'
+        self.topology(router_networks=['192.168.241.1/24'])
+        network = _Row(load_balancer=[self.lb], name='neutron-net-b',
+                       uuid='ls-b')
+        router = _Row(load_balancer=[], uuid='lr-1')
+        with mock.patch.object(self.helper,
+                               '_update_lb_to_lr_association'):
+            self.assertIsNone(self.helper.lb_delete_lrp_assoc(
+                {'network': network, 'router': router}))
+
+
+class TestDetachingAMemberNetwork(ovn_base.TestOvnOctaviaBase):
+    """Detaching a member's network leaves the load balancer on its VIP's.
+
+    A member on network B gives its load balancer a reference on B. Taking
+    B off the router used to take the load balancer off the router, and so
+    off every switch of the router -- its own VIP switch A included: the
+    whole load balancer stopped answering (testbed: 0 of 10 requests, every
+    member reported ONLINE).
+    """
+
+    VIP_PORT = 'vip-port'
+
+    def setUp(self):
+        super().setUp()
+        ovn_conf.register_opts()
+        self.helper = ovn_helper.OvnProviderHelper()
+        self.nb = mock.patch.object(self.helper, 'ovn_nbdb_api').start()
+        self.lr_assoc = mock.patch.object(
+            self.helper, '_update_lb_to_lr_association').start()
+        self.ls_assoc = mock.patch.object(
+            self.helper, '_update_lb_to_ls_association').start()
+        mock.patch.object(self.helper, '_statuses_after_topology_change',
+                          return_value={}).start()
+        self.addCleanup(mock.patch.stopall)
+        self.lb = self.load_balancer({ovn_const.LB_EXT_IDS_VIP_PORT_ID_KEY:
+                                      self.VIP_PORT})
+        self.vip_switch = _Row(name='neutron-net-a',
+                               ports=[_Row(name=self.VIP_PORT)])
+        self.member_switch = _Row(name='neutron-net-b', uuid='ls-b',
+                                  load_balancer=[self.lb], ports=[])
+        self.switches = {'neutron-net-a': self.vip_switch}
+        self.nb.lookup.side_effect = self.lookup
+        self.router = _Row(name='neutron-r', uuid=uuidutils.generate_uuid(),
+                           load_balancer=[self.lb],
+                           ports=[self.router_port('net-a', '10.0.0.1/24')])
+
+    def load_balancer(self, extra):
+        external_ids = {ovn_const.LB_EXT_IDS_LS_REFS_KEY: jsonutils.dumps(
+            {'neutron-net-a': 1, 'neutron-net-b': 1})}
+        external_ids.update(extra)
+        return _Row(uuid=uuidutils.generate_uuid(), name='lb-1',
+                    external_ids=external_ids)
+
+    @staticmethod
+    def router_port(network, cidr):
+        return _Row(gateway_chassis=[], ha_chassis_group=[], networks=[cidr],
+                    external_ids={
+                        ovn_const.OVN_NETWORK_NAME_EXT_ID_KEY: network})
+
+    def lookup(self, table, name):
+        if name not in self.switches:
+            raise idlutils.RowNotFound(table=table, col='name', match=name)
+        return self.switches[name]
+
+    def detach(self, network):
+        self.helper.lb_delete_lrp_assoc(
+            {'network': network, 'router': self.router})
+
+    def test_the_load_balancer_stays_on_the_router_and_its_vip_switch(self):
+        self.detach(self.member_switch)
+        self.lr_assoc.assert_not_called()
+        self.ls_assoc.assert_not_called()
+
+    def test_the_load_balancer_still_leaves_the_detached_switch(self):
+        # Kept on the router, it must not stay on B's switch nor keep
+        # counting B, or each attach/detach cycle would leave one behind.
+        self.detach(self.member_switch)
+        self.nb.ls_lb_del.assert_called_once_with('ls-b', self.lb.uuid,
+                                                  if_exists=True)
+        self.nb.db_set.assert_called_once_with(
+            'Load_Balancer', self.lb.uuid,
+            ('external_ids', {ovn_const.LB_EXT_IDS_LS_REFS_KEY:
+                              jsonutils.dumps({'neutron-net-a': 1})}))
+
+    def test_detaching_the_vip_network_itself_still_removes_it(self):
+        vip_network = _Row(name='neutron-net-a', load_balancer=[self.lb],
+                           ports=[_Row(name=self.VIP_PORT)])
+        self.router.ports = [self.router_port('net-b', '10.0.1.1/24')]
+        self.switches = {'neutron-net-b': _Row(name='neutron-net-b',
+                                               ports=[])}
+        self.detach(vip_network)
+        self.lr_assoc.assert_called_once_with(self.lb, self.router,
+                                              delete=True)
+
+    def test_an_additional_vip_on_the_router_keeps_it_too(self):
+        self.lb = self.load_balancer({
+            ovn_const.LB_EXT_IDS_VIP_PORT_ID_KEY: 'elsewhere',
+            ovn_const.LB_EXT_IDS_ADDIT_VIP_PORT_ID_KEY: 'v6-port,' +
+            self.VIP_PORT})
+        self.member_switch.load_balancer = [self.lb]
+        self.router.load_balancer = [self.lb]
+        self.detach(self.member_switch)
+        self.lr_assoc.assert_not_called()
+
+    def test_unreadable_topology_leaves_the_removal_as_it_was(self):
+        self.nb.lookup.side_effect = RuntimeError('idl gone')
+        self.detach(self.member_switch)
+        self.lr_assoc.assert_called_once_with(self.lb, self.router,
+                                              delete=True)

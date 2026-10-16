@@ -61,6 +61,11 @@ class OvnProviderHelper():
         # Health check events held per load balancer ID, touched only by the
         # request handler thread.
         self._held_hm_events = {}
+        # When each held load balancer started waiting, shared with the one
+        # thread that releases them.
+        self._hm_holds = {}
+        self._hm_holds_lock = threading.Lock()
+        self._hm_release_thread = None
         ovsdb_monitor.check_and_set_ssl_files('OVN_Northbound')
         self._init_lb_actions()
 
@@ -301,9 +306,35 @@ class OvnProviderHelper():
                             rlb.uuid, utils.ovn_uuid(network.name))
                 pass
 
+        # A kept load balancer still leaves the detached switch, references
+        # included: attached again, the switch gets it back from the router.
+        for klb in kept:
+            self._remove_lb_from_detached_ls(klb, network)
+
         # Nothing about a member changed, so no health check event will say
         # that its subnet is no longer routed from the VIP.
         return self._statuses_after_topology_change(nw_lb | r_lb | kept)
+
+    def _remove_lb_from_detached_ls(self, ovn_lb, ovn_ls):
+        try:
+            ls_refs = jsonutils.loads(ovn_lb.external_ids.get(
+                ovn_const.LB_EXT_IDS_LS_REFS_KEY) or '{}')
+        except ValueError:
+            ls_refs = {}
+        ls_refs.pop(ovn_ls.name, None)
+        commands = [
+            self.ovn_nbdb_api.ls_lb_del(ovn_ls.uuid, ovn_lb.uuid,
+                                        if_exists=True),
+            self.ovn_nbdb_api.db_set(
+                'Load_Balancer', ovn_lb.uuid,
+                ('external_ids', {ovn_const.LB_EXT_IDS_LS_REFS_KEY:
+                                  jsonutils.dumps(ls_refs)}))]
+        try:
+            self._execute_commands(commands)
+        except idlutils.RowNotFound:
+            LOG.warning("The disassociation of loadbalancer %s to the "
+                        "logical switch %s failed, just keep going on",
+                        ovn_lb.uuid, ovn_ls.name)
 
     def _lbs_kept_by_vip(self, lbs, router, network):
         """Those of lbs whose VIP port is on a switch still on the router.
@@ -4358,10 +4389,18 @@ class OvnProviderHelper():
         prefixes of every router the load balancer is on, and the logical
         switches holding its VIP ports. None when neither can be found,
         which says nothing either way.
+
+        This runs on every status report, so only the rows the load
+        balancer refers to are read, each by an indexed lookup.
         """
-        tables = self.ovn_nbdb_api.tables
+        api = self.ovn_nbdb_api
         networks = []
-        for lr in list(tables['Logical_Router'].rows.values()):
+        lr_ref = ovn_lb.external_ids.get(ovn_const.LB_EXT_IDS_LR_REF_KEY, '')
+        for name in {n.strip() for n in lr_ref.split(',') if n.strip()}:
+            try:
+                lr = api.lookup('Logical_Router', name)
+            except idlutils.RowNotFound:
+                continue
             if ovn_lb.uuid not in [lb.uuid for lb in lr.load_balancer]:
                 continue
             for lrp in lr.ports:
@@ -4376,10 +4415,16 @@ class OvnProviderHelper():
         if additional:
             vip_ports.update(additional.split(','))
         vip_ports.discard(None)
-        switches = []
-        for ls in list(tables['Logical_Switch'].rows.values()):
-            if any(lsp.name in vip_ports for lsp in ls.ports):
-                switches.append(ls)
+        switches = {}
+        for port in vip_ports:
+            try:
+                lsp = api.lookup('Logical_Switch_Port', port)
+                ls = api.lookup('Logical_Switch', lsp.external_ids.get(
+                    ovn_const.OVN_NETWORK_NAME_EXT_ID_KEY, ''))
+            except (idlutils.RowNotFound, TypeError):
+                continue
+            switches[ls.uuid] = ls
+        switches = list(switches.values())
         if not networks and not switches:
             return None
         return networks, switches
@@ -4604,6 +4649,8 @@ class OvnProviderHelper():
         # it assumed when it finishes, which would overwrite a verdict the
         # health check gave meanwhile, e.g. for a member created already
         # down. Hold the events, in order, until the operation reported.
+        # This relies on the operation writing the member statuses before
+        # it moves the load balancer out of PENDING_*.
         lb_id = ovn_lb.name
         held = self._held_hm_events.get(lb_id)
         if held is not None:
@@ -4611,24 +4658,51 @@ class OvnProviderHelper():
             return True
         if not self._lb_in_flight(lb_id):
             return False
+        if not self._ensure_hm_release_thread():
+            return False
         self._held_hm_events[lb_id] = [(ovn_lb, info)]
-        self._start_hm_release_timer(lb_id, time.monotonic())
+        with self._hm_holds_lock:
+            self._hm_holds[lb_id] = time.monotonic()
         return True
 
-    def _start_hm_release_timer(self, lb_id, started):
-        timer = threading.Timer(ovn_const.HM_EVENT_HOLD_INTERVAL,
-                                self._release_hm_events_when_settled,
-                                args=(lb_id, started))
-        timer.daemon = True
-        timer.start()
+    def _ensure_hm_release_thread(self):
+        # NOTE: a single thread serves every held load balancer. If it cannot
+        # run, events are applied at once rather than held with no release.
+        if self._hm_release_thread and self._hm_release_thread.is_alive():
+            return True
+        thread = threading.Thread(target=self._hm_release_loop, daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            LOG.exception("Could not start the thread releasing held health "
+                          "check events, applying them now")
+            return False
+        self._hm_release_thread = thread
+        return True
 
-    def _release_hm_events_when_settled(self, lb_id, started):
-        if (self._lb_in_flight(lb_id) and
-                time.monotonic() - started < ovn_const.HM_EVENT_HOLD_MAX):
-            self._start_hm_release_timer(lb_id, started)
-            return
-        self.add_request({'type': ovn_const.REQ_TYPE_HM_RELEASE_EVENTS,
-                          'info': {'lb_id': lb_id}})
+    def _hm_release_loop(self):
+        while True:
+            time.sleep(ovn_const.HM_EVENT_HOLD_INTERVAL)
+            try:
+                self._release_settled_hm_holds()
+            except Exception:
+                LOG.exception("Releasing held health check events failed")
+
+    def _release_settled_hm_holds(self):
+        with self._hm_holds_lock:
+            holds = list(self._hm_holds.items())
+        for lb_id, started in holds:
+            # The cap releases a load balancer even if its status can't be
+            # read, so nothing is held for good.
+            if (time.monotonic() - started < ovn_const.HM_EVENT_HOLD_MAX and
+                    self._lb_in_flight(lb_id)):
+                continue
+            self.add_request({'type': ovn_const.REQ_TYPE_HM_RELEASE_EVENTS,
+                              'info': {'lb_id': lb_id}})
+            with self._hm_holds_lock:
+                # A newer hold may have replaced this one after the release.
+                if self._hm_holds.get(lb_id) == started:
+                    del self._hm_holds[lb_id]
 
     def _lb_in_flight(self, lb_id):
         try:
