@@ -9286,8 +9286,9 @@ class TestDetachingAMemberNetwork(ovn_base.TestOvnOctaviaBase):
             self.helper, '_update_lb_to_lr_association').start()
         self.ls_assoc = mock.patch.object(
             self.helper, '_update_lb_to_ls_association').start()
-        mock.patch.object(self.helper, '_statuses_after_topology_change',
-                          return_value={}).start()
+        self.statuses = mock.patch.object(
+            self.helper, '_statuses_after_topology_change',
+            return_value={}).start()
         self.addCleanup(mock.patch.stopall)
         self.lb = self.load_balancer({ovn_const.LB_EXT_IDS_VIP_PORT_ID_KEY:
                                       self.VIP_PORT})
@@ -9364,3 +9365,26 @@ class TestDetachingAMemberNetwork(ovn_base.TestOvnOctaviaBase):
         self.detach(self.member_switch)
         self.lr_assoc.assert_called_once_with(self.lb, self.router,
                                               delete=True)
+
+    def assert_nothing_left(self):
+        self.lr_assoc.assert_not_called()
+        self.ls_assoc.assert_not_called()
+        self.nb.ls_lb_del.assert_not_called()
+        self.nb.db_set.assert_not_called()
+        self.statuses.assert_called_once_with({self.lb})
+
+    def test_another_subnet_of_the_member_network_keeps_everything(self):
+        self.router.ports.append(self.router_port('net-b', '10.0.2.1/24'))
+        self.detach(self.member_switch)
+        self.assert_nothing_left()
+
+    def test_another_subnet_of_the_vip_network_keeps_everything(self):
+        # VIP and member on subnet A of network A; the router port of its
+        # subnet B goes, subnet A's stays.
+        self.lb.external_ids[ovn_const.LB_EXT_IDS_LS_REFS_KEY] = (
+            jsonutils.dumps({'neutron-net-a': 2}))
+        vip_network = _Row(name='neutron-net-a', uuid='ls-a',
+                           load_balancer=[self.lb],
+                           ports=[_Row(name=self.VIP_PORT)])
+        self.detach(vip_network)
+        self.assert_nothing_left()

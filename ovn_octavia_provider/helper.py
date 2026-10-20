@@ -272,12 +272,18 @@ class OvnProviderHelper():
 
         # Find all loadbalancers which have a reference with the network
         nw_lb = self._find_lb_in_ls(network=network)
+        switches = self._lr_switch_names(router)
+        # The router may still be on this network through another subnet:
+        # then nothing leaves, only the members of the detached subnet are
+        # no longer routed.
+        if switches is not None and network.name in switches:
+            return self._statuses_after_topology_change(nw_lb)
         # A member on this network gives its load balancer a reference here
         # too. One whose VIP is on another network still on this router is
         # not leaving it: taking it off the router took it off every switch
         # of the router as well, its own VIP switch included, and the whole
         # load balancer stopped answering.
-        kept = self._lbs_kept_by_vip(nw_lb, router, network)
+        kept = self._lbs_kept_by_vip(nw_lb, switches)
         nw_lb -= kept
         # Find all loadbalancers which have a reference with the router
         r_lb = set(router.load_balancer) - nw_lb - kept
@@ -336,29 +342,37 @@ class OvnProviderHelper():
                         "logical switch %s failed, just keep going on",
                         ovn_lb.uuid, ovn_ls.name)
 
-    def _lbs_kept_by_vip(self, lbs, router, network):
-        """Those of lbs whose VIP port is on a switch still on the router.
-
-        Empty when the topology cannot be read, which leaves the removal
-        as it always was.
-        """
-        if not lbs:
-            return set()
+    def _lr_switch_names(self, router):
+        """Names of the switches the router has an interface on, or None."""
         try:
             names = set()
             for version in (4, 6):
                 names.update(self._find_ls_for_lr(router, ip_version=version))
-            names.discard(network.name)
+        except Exception:
+            LOG.debug('Could not read the switches of router %s',
+                      getattr(router, 'name', router), exc_info=True)
+            return None
+        return names
+
+    def _lbs_kept_by_vip(self, lbs, switches):
+        """Those of lbs whose VIP port is on one of the router's switches.
+
+        Empty when the topology cannot be read, which leaves the removal
+        as it always was.
+        """
+        if not lbs or switches is None:
+            return set()
+        try:
             ports = set()
-            for name in names:
+            for name in switches:
                 try:
                     ls = self.ovn_nbdb_api.lookup('Logical_Switch', name)
                 except idlutils.RowNotFound:
                     continue
                 ports.update(lsp.name for lsp in ls.ports)
         except Exception:
-            LOG.debug('Could not read the switches of router %s',
-                      getattr(router, 'name', router), exc_info=True)
+            LOG.debug('Could not read the switches %s', sorted(switches),
+                      exc_info=True)
             return set()
         kept = set()
         for lb in lbs:

@@ -6,4 +6,5 @@ fixes:
     attached to it. The load balancer used to leave every switch of the
     router, its own VIP switch included, and stopped answering while its
     members read ``ONLINE``. It now only leaves the switch of the detached
-    network.
+    network. Detaching one subnet of a network the router is still on
+    through another subnet leaves every load balancer where it is.
