@@ -4705,12 +4705,36 @@ class OvnProviderHelper():
     def hm_update_event(self, info):
         statuses = []
         for ovn_lb in info['ovn_lbs']:
+            if not self._hm_event_is_news(ovn_lb, info):
+                continue
             if self._hold_hm_event(ovn_lb, info):
                 continue
             status = self._hm_update_event_lb(ovn_lb, info)
             if status:
                 statuses.append(status)
         return self._merge_statuses(statuses)
+
+    def _hm_event_is_news(self, ovn_lb, info):
+        """Whether the event says anything the stored statuses do not.
+
+        The agent's start replays every monitor already offline, and a
+        monitor re-created for a member known to be down repeats the
+        verdict; applying either costs a status read, a transaction and
+        a report that change nothing. An event behind a held one is
+        kept, in order, whatever it says.
+        """
+        if ovn_lb.name in self._held_hm_events:
+            return True
+        verdict = self._hm_event_verdict(ovn_lb, info)
+        if verdict is None:
+            return False
+        member_id, member_status = verdict
+        if self._find_member_status(ovn_lb, member_id) != member_status:
+            return True
+        LOG.debug('Health check event for load balancer %s member %s '
+                  'repeats the recorded status %s', ovn_lb.name, member_id,
+                  member_status)
+        return False
 
     def hm_release_events(self, info):
         statuses = []
@@ -4794,8 +4818,8 @@ class OvnProviderHelper():
                                           constants.PENDING_UPDATE,
                                           constants.PENDING_DELETE)
 
-    def _hm_update_event_lb(self, ovn_lb, info):
-        # Lookup member
+    def _hm_event_verdict(self, ovn_lb, info):
+        """The member the event is about and the status it gives it."""
         member_id = None
         for k, v in ovn_lb.external_ids.items():
             if ovn_const.LB_EXT_IDS_POOL_PREFIX not in k:
@@ -4823,15 +4847,16 @@ class OvnProviderHelper():
             # monitor for good. A monitor that went away is ERROR.
             if self._is_member_offline(ovn_lb, member_id):
                 return None
-            member_status = constants.ERROR
-        elif info['status'] == ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE:
-            member_status = constants.ERROR
-        else:
-            member_status = constants.ONLINE
+            return member_id, constants.ERROR
+        if info['status'] == ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE:
+            return member_id, constants.ERROR
+        return member_id, constants.ONLINE
 
-        self._update_external_ids_member_status(ovn_lb,
-                                                [(member_id,
-                                                  member_status)])
+    def _hm_update_event_lb(self, ovn_lb, info):
+        verdict = self._hm_event_verdict(ovn_lb, info)
+        if verdict is None:
+            return None
+        self._update_external_ids_member_status(ovn_lb, [verdict])
         return self._get_current_operating_statuses(ovn_lb)
 
     @staticmethod
