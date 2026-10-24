@@ -726,7 +726,10 @@ class TestOvnOctaviaBase(base.TestOVNFunctionalBase,
                                     found = True
 
                 if p.healthmonitor:
-                    member_status[m.member_id] = o_constants.ONLINE
+                    # A monitored member's status is the health check's to
+                    # give; until it does, none is stored.
+                    if not m.admin_state_up:
+                        member_status[m.member_id] = o_constants.OFFLINE
                     external_ids[ovn_const.LB_EXT_IDS_HMS_KEY] = \
                         jsonutils.dumps([p.healthmonitor.healthmonitor_id])
                 else:
@@ -1103,9 +1106,9 @@ class TestOvnOctaviaBase(base.TestOVNFunctionalBase,
              'provisioning_status': o_constants.ACTIVE}
             for listener in pool_listeners]
 
+        # The members are the health check's to report from here on.
         expected_member_status = [
-            {'id': m.member_id, 'provisioning_status': o_constants.ACTIVE,
-             'operating_status': o_constants.ONLINE}
+            {'id': m.member_id, 'provisioning_status': o_constants.ACTIVE}
             for m in pool.members]
 
         expected_hm_status = {'id': m_hm.healthmonitor_id,

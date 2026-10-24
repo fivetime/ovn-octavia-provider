@@ -17,7 +17,6 @@ import copy
 import queue
 import re
 import threading
-import time
 
 import netaddr
 from neutron_lib import constants as n_const
@@ -82,14 +81,6 @@ class OvnProviderHelper():
         self.helper_thread = threading.Thread(target=self.request_handler)
         self.helper_thread.daemon = True
         self._octavia_driver_lib = o_driver_lib.DriverLibrary()
-        # Health check events held per load balancer ID, touched only by the
-        # request handler thread.
-        self._held_hm_events = {}
-        # When each held load balancer started waiting, shared with the one
-        # thread that releases them.
-        self._hm_holds = {}
-        self._hm_holds_lock = threading.Lock()
-        self._hm_release_thread = None
         ovsdb_monitor.check_and_set_ssl_files('OVN_Northbound')
         self._init_lb_actions()
 
@@ -122,7 +113,6 @@ class OvnProviderHelper():
             ovn_const.REQ_TYPE_HM_UPDATE: self.hm_update,
             ovn_const.REQ_TYPE_HM_DELETE: self.hm_delete,
             ovn_const.REQ_TYPE_HM_UPDATE_EVENT: self.hm_update_event,
-            ovn_const.REQ_TYPE_HM_RELEASE_EVENTS: self.hm_release_events,
         }
 
     @staticmethod
@@ -2759,46 +2749,58 @@ class OvnProviderHelper():
                     constants.ID: mem_info.split('_')[1],
                     constants.PROVISIONING_STATUS: provisioning_status,
                     constants.OPERATING_STATUS: operating_status})
-                self._update_external_ids_member_status(
-                    ovn_lb,
-                    [(mem_info.split('_')[1],
-                      operating_status)])
+            self._update_external_ids_member_status(
+                ovn_lb,
+                [(member[constants.ID], operating_status)
+                 for member in member_statuses])
         return member_statuses
+
+    def _stored_member_statuses(self, ovn_lb):
+        try:
+            statuses = jsonutils.loads(
+                ovn_lb.external_ids.get(ovn_const.OVN_MEMBER_STATUS_KEY))
+        except (TypeError, ValueError):
+            LOG.debug("no member status on external_ids of %s", ovn_lb.name)
+            return {}
+        return statuses if isinstance(statuses, dict) else {}
 
     def _update_external_ids_member_status(self, ovn_lb, members_and_opstatus,
                                            delete=False):
+        """Store the operating status of members, or drop it.
 
-        existing_members = ovn_lb.external_ids.get(
-            ovn_const.OVN_MEMBER_STATUS_KEY)
+        A status of None, as delete, drops the member's entry: the member
+        is the health check's to report. The entries are merged into the
+        row when the transaction commits, so a status stored meanwhile by
+        another writer, the agent's verdict for one, is kept.
+        """
+        statuses = {member: None if delete else status
+                    for member, status in members_and_opstatus}
+        if not statuses:
+            return
         try:
-            existing_members = jsonutils.loads(existing_members)
-        except TypeError:
-            LOG.debug("no member status on external_ids: %s",
-                      str(existing_members))
-            existing_members = {}
-
-        for (member, status) in members_and_opstatus:
-            if delete:
-                if member in existing_members:
-                    del existing_members[member]
-            else:
-                existing_members[member] = status
-
-        try:
-            if existing_members:
-                member_status = {
-                    ovn_const.OVN_MEMBER_STATUS_KEY:
-                        jsonutils.dumps(existing_members)}
-                self.ovn_nbdb_api.db_set(
-                    'Load_Balancer', ovn_lb.uuid,
-                    ('external_ids', member_status)).execute()
-            else:
-                self.ovn_nbdb_api.db_remove(
-                    'Load_Balancer', ovn_lb.uuid, 'external_ids',
-                    (ovn_const.OVN_MEMBER_STATUS_KEY)).execute()
+            self.ovn_nbdb_api.lb_update_member_status(
+                ovn_lb.uuid, statuses).execute()
         except Exception:
             LOG.exception("Error storing member statuses on external_ids "
                           "delete: %s", str(delete))
+
+    def _leave_members_to_hm(self, ovn_lb, pool_key):
+        """Drop the NO_MONITOR entries of a pool that is monitored now.
+
+        The health check gives a monitored member its status, and until
+        it does the member is left out of the reports. An admin-down
+        member stays OFFLINE, and a verdict already stored stands.
+
+        :returns: the IDs of the pool's members
+        """
+        member_ids = [
+            mb_id for _ip, _port, _subnet, mb_id in self._extract_member_info(
+                ovn_lb.external_ids[pool_key])]
+        stored = self._stored_member_statuses(ovn_lb)
+        self._update_external_ids_member_status(
+            ovn_lb, [(mb_id, None) for mb_id in member_ids
+                     if stored.get(mb_id) == constants.NO_MONITOR])
+        return member_ids
 
     def _get_members_in_ovn_lb(self, ovn_lb, pool_key):
         existing_members = ovn_lb.external_ids.get(pool_key, None)
@@ -2862,8 +2864,10 @@ class OvnProviderHelper():
 
         # TODO(froyo): Check if originally status in Octavia is ERROR if
         # we receive that info from the object
-        self._update_external_ids_member_status(
-            ovn_lb, [(member[constants.ID], constants.NO_MONITOR)])
+        # A monitored member's status is the health check's to give.
+        if not ovn_lb.health_check:
+            self._update_external_ids_member_status(
+                ovn_lb, [(member[constants.ID], constants.NO_MONITOR)])
 
     def _add_member(self, member, ovn_lb, pool_key):
         external_ids = copy.deepcopy(ovn_lb.external_ids)
@@ -2961,16 +2965,18 @@ class OvnProviderHelper():
 
             if not member[constants.ADMIN_STATE_UP]:
                 operating_status = constants.OFFLINE
-            elif (new_member and operating_status == constants.NO_MONITOR and
-                    ovn_lb.health_check):
-                operating_status = constants.ONLINE
-                mb_ip, mb_port, mb_subnet, mb_id = self._extract_member_info(
-                    new_member)[0]
-                mb_status = self._update_hm_member(ovn_lb, pool_key, mb_ip)
-                operating_status = (
-                    constants.ERROR
-                    if mb_status != constants.ONLINE else mb_status
-                )
+            elif ovn_lb.health_check:
+                # The health check gives a monitored member its status; the
+                # operation sets up the monitor and stores nothing, unless
+                # the member cannot be monitored at all.
+                operating_status = None
+                if new_member:
+                    mb_ip, mb_port, mb_subnet, mb_id = (
+                        self._extract_member_info(new_member)[0])
+                    mb_status = self._update_hm_member(
+                        ovn_lb, pool_key, mb_ip)
+                    if mb_status != constants.ONLINE:
+                        operating_status = constants.ERROR
 
             member_status.append({
                 constants.ID: member[constants.ID],
@@ -2979,9 +2985,11 @@ class OvnProviderHelper():
         self._update_external_ids_member_status(
             ovn_lb,
             [(member[constants.ID], member[constants.OPERATING_STATUS])
-             for member in member_status])
+             for member in member_status
+             if member[constants.OPERATING_STATUS] is not None])
 
-        status = self._get_current_operating_statuses(ovn_lb)
+        status = self._get_current_operating_statuses(
+            ovn_lb, member_ids=[m[constants.ID] for m in member_status])
         return status
 
     def _remove_member(self, member, ovn_lb, pool_key):
@@ -3082,6 +3090,7 @@ class OvnProviderHelper():
         error_updating_member = False
         refresh_vips = False
         member_status = []
+        writes = []
 
         try:
             pool_key, ovn_lb = self._find_ovn_lb_by_pool_id(
@@ -3100,54 +3109,39 @@ class OvnProviderHelper():
                      constants.OPERATING_STATUS: constants.NO_MONITOR})
                 continue
             try:
-                member_operating_status = constants.NO_MONITOR
                 last_status = self._find_member_status(
                     ovn_lb, member[constants.ID])
+                entry = {constants.ID: member[constants.ID],
+                         constants.PROVISIONING_STATUS: constants.ACTIVE}
                 if constants.ADMIN_STATE_UP in member:
-                    if member[constants.ADMIN_STATE_UP]:
-                        # if HM exists trust on neutron:member_status
-                        # as the last status valid for the member
-                        if ovn_lb.health_check:
-                            # Put member ONLINE if was OFFLINE and trust on
-                            # HM to come back to ERROR in case neccesary, it
-                            # was already on ERROR keeps at that way.
-                            member_operating_status = (
-                                constants.ERROR
-                                if last_status == constants.ERROR
-                                else constants.ONLINE
-                            )
-                        else:
-                            member_operating_status = constants.NO_MONITOR
-                    else:
-                        member_operating_status = constants.OFFLINE
+                    if not member[constants.ADMIN_STATE_UP]:
+                        entry[constants.OPERATING_STATUS] = constants.OFFLINE
+                    elif not ovn_lb.health_check:
+                        entry[constants.OPERATING_STATUS] = (
+                            constants.NO_MONITOR)
+                    elif last_status in (constants.OFFLINE,
+                                         constants.NO_MONITOR):
+                        # Back in the pool, the member is the health
+                        # check's to report, as a new one is.
+                        writes.append((member[constants.ID], None))
+                    if constants.OPERATING_STATUS in entry:
+                        writes.append((member[constants.ID],
+                                       entry[constants.OPERATING_STATUS]))
 
                     # NOTE(froyo): If we are toggling from/to OFFLINE due to an
                     # admin_state_up change, in that case we should update vips
-                    if (
-                        last_status != constants.OFFLINE and
-                        member_operating_status == constants.OFFLINE
-                    ) or (
-                        last_status == constants.OFFLINE and
-                        member_operating_status != constants.OFFLINE
-                    ) or (
-                        member[constants.ADMIN_STATE_UP]
-                    ):
+                    if (member[constants.ADMIN_STATE_UP] or
+                            last_status != constants.OFFLINE):
                         refresh_vips = True
 
-                member_status.append({
-                    constants.ID: member[constants.ID],
-                    constants.PROVISIONING_STATUS: constants.ACTIVE,
-                    constants.OPERATING_STATUS: member_operating_status})
+                member_status.append(entry)
 
             except Exception:
                 LOG.exception(ovn_const.EXCEPTION_MSG, "update of member")
                 error_updating_member = True
 
-        if member_status:
-            self._update_external_ids_member_status(
-                ovn_lb,
-                [(member[constants.ID], member[constants.OPERATING_STATUS])
-                 for member in member_status])
+        if writes:
+            self._update_external_ids_member_status(ovn_lb, writes)
 
         if refresh_vips:
             commands = []
@@ -4092,12 +4086,6 @@ class OvnProviderHelper():
                  constants.PROVISIONING_STATUS: constants.ACTIVE,
                  constants.OPERATING_STATUS: constants.ONLINE})
 
-        # Update status for all members in the pool
-        member_status = self._update_member_statuses(ovn_lb, pool_id,
-                                                     constants.ACTIVE,
-                                                     constants.ONLINE)
-        status[constants.MEMBERS] = member_status
-
         # MONITOR_PRT = 80
         # ovn-nbctl --wait=sb -- --id=@hc create Load_Balancer_Health_Check
         #   vip="${LB_VIP_ADDR}\:${MONITOR_PRT}" -- add Load_Balancer
@@ -4106,6 +4094,8 @@ class OvnProviderHelper():
         # from info object passed-in
         hm_status = self._add_lbhc(ovn_lb, pool_key, info)
         if hm_status[constants.PROVISIONING_STATUS] == constants.ACTIVE:
+            # From here on the health check gives the members their status.
+            member_ids = self._leave_members_to_hm(ovn_lb, pool_key)
             for mb_ip, mb_port, mb_subnet, mb_id in self._extract_member_info(
                     ovn_lb.external_ids[pool_key]):
                 mb_status = self._update_hm_member(ovn_lb, pool_key, mb_ip)
@@ -4114,10 +4104,13 @@ class OvnProviderHelper():
                     hm_status[constants.OPERATING_STATUS] = constants.ERROR
                     self._clean_ip_port_mappings(ovn_lb, pool_key)
                     break
-                self._update_external_ids_member_status(
-                    ovn_lb, [(mb_id, mb_status)])
+                if mb_status == constants.ERROR:
+                    # The member has no port to be monitored through.
+                    self._update_external_ids_member_status(
+                        ovn_lb, [(mb_id, mb_status)])
             else:
-                status = self._get_current_operating_statuses(ovn_lb)
+                status = self._get_current_operating_statuses(
+                    ovn_lb, member_ids=member_ids)
         status[constants.HEALTHMONITORS] = [hm_status]
         return status
 
@@ -4146,9 +4139,7 @@ class OvnProviderHelper():
             self.hm_create(hm)
             return
 
-        pool_id = hm[constants.POOL_ID]
-        self._update_member_statuses(ovn_lb, pool_id, constants.ACTIVE,
-                                     constants.ONLINE)
+        self._leave_members_to_hm(ovn_lb, pool_key)
         try:
             self._sync_lbhc(ovn_lb, pool_key, hm)
         except Exception as e:
@@ -4160,8 +4151,9 @@ class OvnProviderHelper():
             if not mb_status:
                 self._clean_ip_port_mappings(ovn_lb, pool_key)
                 break
-            self._update_external_ids_member_status(
-                ovn_lb, [(mb_id, mb_status)])
+            if mb_status == constants.ERROR:
+                self._update_external_ids_member_status(
+                    ovn_lb, [(mb_id, mb_status)])
 
     def hm_update(self, info):
         status = {
@@ -4378,6 +4370,54 @@ class OvnProviderHelper():
         self.add_request({'type': ovn_const.REQ_TYPE_HM_UPDATE_EVENT,
                           'info': request_info})
 
+    def lb_member_status_handler(self, ovn_lb, sb_api):
+        """Replay the health check status of members stored without one.
+
+        Members sharing a backend share its Service_Monitor row, so one
+        added, or enabled again, behind a row that already has a status
+        gets no event of its own. Each member of the load balancer with
+        no stored status whose row has one is reported as if the row had
+        just changed. A member whose row has no status yet is reported
+        when it gets one.
+        """
+        stored = self._stored_member_statuses(ovn_lb)
+        mappings = ovn_lb.ip_port_mappings
+        seen = set()
+        for key, value in ovn_lb.external_ids.items():
+            if not key.startswith(ovn_const.LB_EXT_IDS_POOL_PREFIX):
+                continue
+            for mb_ip, mb_port, _subnet, mb_id in self._extract_member_info(
+                    value):
+                if mb_id in stored or (mb_ip, mb_port) in seen:
+                    continue
+                seen.add((mb_ip, mb_port))
+                mapping_key = mb_ip
+                if netaddr.IPNetwork(mb_ip).version == n_const.IP_VERSION_6:
+                    mapping_key = f'[{mb_ip}]'
+                mapping = mappings.get(mapping_key)
+                if not mapping:
+                    continue
+                conditions = [('ip', '=', mb_ip), ('port', '=', int(mb_port)),
+                              ('logical_port', '=', mapping.split(':', 1)[0])]
+                if ovn_lb.protocol:
+                    conditions.append(('protocol', '=', ovn_lb.protocol[0]))
+                try:
+                    rows = sb_api.db_find_rows(
+                        'Service_Monitor', *conditions).execute(
+                            check_error=True)
+                except Exception:
+                    LOG.exception('Could not read the health check status '
+                                  'of load balancer %s member %s',
+                                  ovn_lb.name, mb_id)
+                    continue
+                for row in rows:
+                    if row.status in (ovn_const.HM_EVENT_MEMBER_PORT_ONLINE,
+                                      ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE):
+                        LOG.debug('Replaying the health check status %s of '
+                                  'load balancer %s member %s', row.status,
+                                  ovn_lb.name, mb_id)
+                        self.sm_update_event_handler(row)
+
     # NOTE(froyo) those methods are to get the admin_state_up of the pool or
     # listener independently of the type, octavia_lib when is requested by full
     # lb is returning listeners and pools as dicts, but if a pool or listener
@@ -4549,20 +4589,29 @@ class OvnProviderHelper():
                 continue
             try:
                 unreachable = self._unreachable_members(ovn_lb, recorded)
-                if (unreachable is None or
-                        unreachable == self._recorded_unreachable(ovn_lb)):
+                if unreachable is None:
                     continue
-                statuses.append(self._get_current_operating_statuses(ovn_lb))
+                changed = unreachable ^ self._recorded_unreachable(ovn_lb)
+                if not changed:
+                    continue
+                # The members the change put out of reach, or brought back.
+                statuses.append(self._get_current_operating_statuses(
+                    ovn_lb, member_ids=sorted(changed & set(recorded))))
             except Exception:
                 LOG.exception('Could not re-report load balancer %s after '
                               'a router interface change', ovn_lb.name)
         return self._merge_statuses(statuses)
 
-    def _get_current_operating_statuses(self, ovn_lb):
-        # NOTE (froyo) We would base all logic in the external_ids field
-        # 'neutron:member_status' that should include all LB member status
-        # in order to calculate the global LB status (listeners, pools, members
-        # included)
+    def _get_current_operating_statuses(self, ovn_lb, member_ids=None):
+        """The statuses to report after acting on the load balancer.
+
+        The pool, listener and load balancer statuses follow from the
+        member statuses stored under 'neutron:member_status', a member
+        stored without one counting as up. Of the members, only those
+        given, the ones acted on, are reported, each with its stored
+        status if it has one: the rest are the health check's to report,
+        and Octavia leaves a member it is not told about alone.
+        """
         status = {
             constants.LOADBALANCERS: [],
             constants.LISTENERS: [],
@@ -4594,11 +4643,12 @@ class OvnProviderHelper():
                     x.split('_')[1] for x in v.split(',') if x]
                 continue
 
-        for member_id, member_status in member_statuses.items():
-            status[constants.MEMBERS].append({
-                constants.ID: member_id,
-                constants.PROVISIONING_STATUS: constants.ACTIVE,
-                constants.OPERATING_STATUS: member_status})
+        for member_id in member_ids or ():
+            member = {constants.ID: member_id,
+                      constants.PROVISIONING_STATUS: constants.ACTIVE}
+            if member_id in member_statuses:
+                member[constants.OPERATING_STATUS] = member_statuses[member_id]
+            status[constants.MEMBERS].append(member)
 
         _lb = self._octavia_driver_lib.get_loadbalancer(ovn_lb.name)
 
@@ -4623,7 +4673,7 @@ class OvnProviderHelper():
             _pool = lb_pools.get(pool_id)
             if not _pool:
                 _pool = self._octavia_driver_lib.get_pool(pool_id)
-            if not self._get_pool_admin_state(_pool) or not member_statuses:
+            if not self._get_pool_admin_state(_pool) or not pools[pool_id]:
                 pools[pool_id] = constants.OFFLINE
             elif pools[pool_id] and all(constants.ERROR == member_status
                                         for member_status in pools[pool_id]):
@@ -4690,156 +4740,69 @@ class OvnProviderHelper():
             verdict = self._hm_event_verdict(ovn_lb, info)
             if verdict is None:
                 continue
-            # The hold comes first: an event behind a held one is kept, in
-            # order, whatever it says, and a repeated verdict behind an
-            # operation waits for its report rather than being dropped.
-            if self._hold_hm_event(ovn_lb, info):
+            member_ids, member_status = verdict
+            member_ids = self._hm_event_news(ovn_lb, member_ids, member_status)
+            if not member_ids:
                 continue
-            if not self._hm_event_is_news(ovn_lb, verdict):
-                continue
-            status = self._hm_update_event_lb(ovn_lb, info)
-            if status:
-                statuses.append(status)
+            self._update_external_ids_member_status(
+                ovn_lb, [(mb_id, member_status) for mb_id in member_ids])
+            statuses.append(self._get_current_operating_statuses(
+                ovn_lb, member_ids=member_ids))
+
         return self._merge_statuses(statuses)
-
-    def _hm_event_is_news(self, ovn_lb, verdict):
-        """Whether the verdict differs from the stored member status.
-
-        The agent's start replays every monitor already offline, and a
-        monitor re-created for a member known to be down repeats the
-        verdict; applying either costs a transaction and a report that
-        change nothing.
-        """
-        member_id, member_status = verdict
-        if self._find_member_status(ovn_lb, member_id) != member_status:
-            return True
-        LOG.debug('Health check event for load balancer %s member %s '
-                  'repeats the recorded status %s', ovn_lb.name, member_id,
-                  member_status)
-        return False
-
-    def hm_release_events(self, info):
-        statuses = []
-        for ovn_lb, event in self._held_hm_events.pop(info['lb_id'], []):
-            status = self._hm_update_event_lb(ovn_lb, event)
-            if status:
-                statuses.append(status)
-        return self._merge_statuses(statuses)
-
-    def _hold_hm_event(self, ovn_lb, info):
-        # NOTE: an operation on the load balancer reports the member statuses
-        # it assumed when it finishes, which would overwrite a verdict the
-        # health check gave meanwhile, e.g. for a member created already
-        # down. Hold the events, in order, until the operation reported.
-        # This relies on the operation writing the member statuses before
-        # it moves the load balancer out of PENDING_*.
-        lb_id = ovn_lb.name
-        held = self._held_hm_events.get(lb_id)
-        if held is not None:
-            held.append((ovn_lb, info))
-            return True
-        if not self._lb_in_flight(lb_id):
-            return False
-        if not self._ensure_hm_release_thread():
-            return False
-        self._held_hm_events[lb_id] = [(ovn_lb, info)]
-        with self._hm_holds_lock:
-            self._hm_holds[lb_id] = time.monotonic()
-        return True
-
-    def _ensure_hm_release_thread(self):
-        # NOTE: a single thread serves every held load balancer. If it cannot
-        # run, events are applied at once rather than held with no release.
-        if self._hm_release_thread and self._hm_release_thread.is_alive():
-            return True
-        thread = threading.Thread(target=self._hm_release_loop, daemon=True)
-        try:
-            thread.start()
-        except Exception:
-            LOG.exception("Could not start the thread releasing held health "
-                          "check events, applying them now")
-            return False
-        self._hm_release_thread = thread
-        return True
-
-    def _hm_release_loop(self):
-        while True:
-            time.sleep(ovn_const.HM_EVENT_HOLD_INTERVAL)
-            try:
-                self._release_settled_hm_holds()
-            except Exception:
-                LOG.exception("Releasing held health check events failed")
-
-    def _release_settled_hm_holds(self):
-        with self._hm_holds_lock:
-            holds = list(self._hm_holds.items())
-        for lb_id, started in holds:
-            # The cap releases a load balancer even if its status can't be
-            # read, so nothing is held for good.
-            if (time.monotonic() - started < ovn_const.HM_EVENT_HOLD_MAX and
-                    self._lb_in_flight(lb_id)):
-                continue
-            self.add_request({'type': ovn_const.REQ_TYPE_HM_RELEASE_EVENTS,
-                              'info': {'lb_id': lb_id}})
-            with self._hm_holds_lock:
-                # A newer hold may have replaced this one after the release.
-                if self._hm_holds.get(lb_id) == started:
-                    del self._hm_holds[lb_id]
-
-    def _lb_in_flight(self, lb_id):
-        try:
-            lb = clients.get_octavia_client().get_load_balancer(lb_id)
-        except openstack.exceptions.ResourceNotFound:
-            return False
-        except Exception:
-            LOG.warning("Could not read the provisioning status of load "
-                        "balancer %s, applying its health check events "
-                        "now", lb_id, exc_info=True)
-            return False
-        return lb.provisioning_status in (constants.PENDING_CREATE,
-                                          constants.PENDING_UPDATE,
-                                          constants.PENDING_DELETE)
 
     def _hm_event_verdict(self, ovn_lb, info):
-        """The member the event is about and the status it gives it."""
-        member_id = None
-        for k, v in ovn_lb.external_ids.items():
-            if ovn_const.LB_EXT_IDS_POOL_PREFIX not in k:
-                continue
-            for (
-                mb_ip, mb_port, mb_subnet, mb_id,
-            ) in self._extract_member_info(v):
-                if info['ip'] != mb_ip:
-                    continue
-                if info['port'] != mb_port:
-                    continue
-                member_id = mb_id
-                break
+        """The members the event is about and the status it gives them.
 
-            # found it in inner loop
-            if member_id:
-                break
-
-        if not member_id:
+        Pools of one load balancer may share the backend, and so its
+        Service_Monitor row: the event is for every member with it.
+        """
+        member_ids = self._members_at(ovn_lb, info['ip'], info['port'])
+        if not member_ids:
             LOG.warning('Member for event not found, info: %s', info)
             return None
         if info['delete']:
             # NOTE: OFFLINE means administratively disabled and takes
             # the member out of the vips, which would remove its
             # monitor for good. A monitor that went away is ERROR.
-            if self._is_member_offline(ovn_lb, member_id):
+            member_ids = [mb_id for mb_id in member_ids
+                          if not self._is_member_offline(ovn_lb, mb_id)]
+            if not member_ids:
                 return None
-            return member_id, constants.ERROR
+            return member_ids, constants.ERROR
         if info['status'] == ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE:
-            return member_id, constants.ERROR
-        return member_id, constants.ONLINE
+            return member_ids, constants.ERROR
+        return member_ids, constants.ONLINE
 
-    def _hm_update_event_lb(self, ovn_lb, info):
-        verdict = self._hm_event_verdict(ovn_lb, info)
-        if verdict is None:
-            return None
-        self._update_external_ids_member_status(ovn_lb, [verdict])
-        return self._get_current_operating_statuses(ovn_lb)
+    def _hm_event_news(self, ovn_lb, member_ids, member_status):
+        """The members whose stored status differs from the verdict.
+
+        The agent's start replays every monitor already offline, a
+        monitor re-created for a member known to be down repeats the
+        verdict, and the status replayed for a member behind a shared
+        row reaches the members stored with it too; applying any of
+        them costs a transaction and a report that change nothing.
+        """
+        stored = self._stored_member_statuses(ovn_lb)
+        news = []
+        for member_id in member_ids:
+            if stored.get(member_id, constants.NO_MONITOR) != member_status:
+                news.append(member_id)
+                continue
+            LOG.debug('Health check event for load balancer %s member %s '
+                      'repeats the recorded status %s', ovn_lb.name,
+                      member_id, member_status)
+        return news
+
+    def _members_at(self, ovn_lb, ip, port):
+        """The IDs of the load balancer's members at an address and port."""
+        return [
+            mb_id
+            for key, value in ovn_lb.external_ids.items()
+            if ovn_const.LB_EXT_IDS_POOL_PREFIX in key
+            for mb_ip, mb_port, _subnet, mb_id in self._extract_member_info(
+                value)
+            if mb_ip == ip and mb_port == port]
 
     @staticmethod
     def _merge_statuses(statuses):
