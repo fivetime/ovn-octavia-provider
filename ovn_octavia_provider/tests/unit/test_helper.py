@@ -352,6 +352,31 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
                               mock.call(self.ovn_hm_lb.uuid, 'address2'),
                               mock.ANY])
 
+    def test__clean_ip_port_mappings_ignores_a_disabled_other_pool_member(
+            self):
+        # A disabled member of another pool is not monitored; its address
+        # kept the entry when the health monitor was deleted.
+        mapping = self.helper.ovn_nbdb_api.lb_del_ip_port_mapping
+        self.ovn_hm_lb.external_ids['pool_1'] = (
+            'member_uuid1_address1:port1_subnet1')
+        self.ovn_hm_lb.external_ids['pool_2'] = (
+            'member_uuid3_address1:port3_subnet1,'
+            'member_uuid4_address1:port4_subnet1')
+        self.ovn_hm_lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY] = (
+            jsonutils.dumps({'uuid1': constants.ONLINE,
+                             'uuid3': constants.OFFLINE,
+                             'uuid4': constants.NO_MONITOR}))
+        self.helper._clean_ip_port_mappings(self.ovn_hm_lb, 'pool_1')
+        mapping.assert_called_once_with(self.ovn_hm_lb.uuid, 'address1')
+        # Monitored, the same member keeps it.
+        mapping.reset_mock()
+        self.ovn_hm_lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY] = (
+            jsonutils.dumps({'uuid1': constants.ONLINE,
+                             'uuid3': constants.ERROR,
+                             'uuid4': constants.NO_MONITOR}))
+        self.helper._clean_ip_port_mappings(self.ovn_hm_lb, 'pool_1')
+        mapping.assert_not_called()
+
     def test__clean_ip_port_mappings_two_hm_pools_not_sharing_members(self):
         self.member_line_pool1 = 'member_uuid1_address1:port1_subnet1, \
             member_uuid2_address2:port2_subnet1'

@@ -3899,42 +3899,13 @@ class OvnProviderHelper():
         #  HEALTH_SRC: source IP of hm_port
 
         if delete:
-            # Before removing a member from ip_port_mappings, make sure no
-            # other member uses the same address. The mapping is per address,
-            # so a member of the same pool on another port loses its monitor
-            # too; only the leaving member itself can be skipped, when known.
-            other_members = []
-            for k, v in ovn_lb.external_ids.items():
-                if ovn_const.LB_EXT_IDS_POOL_PREFIX not in k:
-                    continue
-                if k == pool_key and member_id is None:
-                    continue
-                other_members.extend(
-                    item for item in self._extract_member_info(v)
-                    if item[3] != member_id)
-            member_statuses = ovn_lb.external_ids.get(
-                ovn_const.OVN_MEMBER_STATUS_KEY)
-            try:
-                member_statuses = jsonutils.loads(member_statuses)
-            except TypeError:
-                LOG.debug("No member status in external_ids: %s",
-                          str(member_statuses))
-                member_statuses = {}
-            execute_delete = True
-            for other_id in [item[3] for item in other_members
-                             if item[0] == backend_ip]:
-                # A disabled member is not monitored; enabling it adds the
-                # mapping back.
-                if member_statuses.get(other_id, '') not in (
-                        constants.NO_MONITOR, constants.OFFLINE):
-                    execute_delete = False
-                    LOG.debug(
-                        f"Backend {backend_ip} still in use by member"
-                        f" {other_id}, "
-                        f"so it won't be removed"
-                    )
-                    break
-            if execute_delete:
+            # The mapping is per address: it stays while another monitored
+            # member has the address. A caller not naming the leaving member
+            # cannot tell it from its pool, which is then left out, as before.
+            if not self._address_in_use(
+                    ovn_lb, backend_ip,
+                    pool_key=pool_key if member_id is None else None,
+                    member_id=member_id):
                 LOG.debug(f"Removing ip_port_mapping for {backend_ip}")
                 self.ovn_nbdb_api.lb_del_ip_port_mapping(
                     ovn_lb.uuid, backend_ip).execute()
@@ -3944,46 +3915,51 @@ class OvnProviderHelper():
                                                      port_name,
                                                      src_ip).execute()
 
+    def _address_in_use(self, ovn_lb, backend_ip, pool_key=None,
+                        member_id=None):
+        """Whether a monitored member staying behind has the address.
+
+        ip_port_mappings is keyed by address, so the entry of an address
+        goes only when no member left needs it. Every member of pool_key
+        leaves when it is given, else member_id alone. A member without a
+        monitor, or administratively disabled, needs no entry; enabling it
+        adds the entry back.
+        """
+        member_statuses = ovn_lb.external_ids.get(
+            ovn_const.OVN_MEMBER_STATUS_KEY)
+        try:
+            member_statuses = jsonutils.loads(member_statuses)
+        except TypeError:
+            LOG.debug("No member status in external_ids: %s",
+                      str(member_statuses))
+            member_statuses = {}
+        for k, v in ovn_lb.external_ids.items():
+            if ovn_const.LB_EXT_IDS_POOL_PREFIX not in k or k == pool_key:
+                continue
+            for mb_ip, _port, _subnet, mb_id in self._extract_member_info(v):
+                if mb_ip != backend_ip or mb_id == member_id:
+                    continue
+                if member_statuses.get(mb_id, '') in (
+                        constants.NO_MONITOR, constants.OFFLINE):
+                    continue
+                LOG.debug("Backend %s still in use by member %s, so it "
+                          "won't be removed", backend_ip, mb_id)
+                return True
+        return False
+
     def _clean_ip_port_mappings(self, ovn_lb, pool_key=None):
         if not pool_key:
             self.ovn_nbdb_api.db_clear('Load_Balancer', ovn_lb.uuid,
                                        'ip_port_mappings').execute()
         else:
-            # NOTE(froyo): before removing a member from the ip_port_mappings
-            # list, we need to ensure that the member is not being monitored by
-            # any other existing HM. To prevent accidentally removing the
-            # member we can use the neutron:member_status to search for any
-            # other members with the same address
-            members_try_remove = self._extract_member_info(
-                ovn_lb.external_ids[pool_key])
-            other_members = []
-            for k, v in ovn_lb.external_ids.items():
-                if ovn_const.LB_EXT_IDS_POOL_PREFIX in k and k != pool_key:
-                    other_members.extend(self._extract_member_info(
-                        ovn_lb.external_ids[k]))
-
-            member_statuses = ovn_lb.external_ids.get(
-                ovn_const.OVN_MEMBER_STATUS_KEY)
-
-            try:
-                member_statuses = jsonutils.loads(member_statuses)
-            except TypeError:
-                LOG.debug("no member status on external_ids: %s",
-                          str(member_statuses))
-                member_statuses = {}
-
-            for (mb_ip, mb_port, mb_subnet, mb_id) in members_try_remove:
-                delete = True
-                for member_id in [item[3] for item in other_members
-                                  if item[0] == mb_ip]:
-                    if member_statuses.get(
-                            member_id, '') != constants.NO_MONITOR:
-                        # same address being monitorized by another HM
-                        delete = False
-
-                if delete:
-                    self.ovn_nbdb_api.lb_del_ip_port_mapping(
-                        ovn_lb.uuid, mb_ip).execute()
+            # Every member of the pool leaves its monitor; the entry of an
+            # address stays while a monitored member of another pool has it.
+            for mb_ip, _port, _subnet, _id in self._extract_member_info(
+                    ovn_lb.external_ids[pool_key]):
+                if self._address_in_use(ovn_lb, mb_ip, pool_key=pool_key):
+                    continue
+                self.ovn_nbdb_api.lb_del_ip_port_mapping(
+                    ovn_lb.uuid, mb_ip).execute()
 
     def _update_hm_member(self, ovn_lb, pool_key, backend_ip, delete=False,
                           member_id=None):
