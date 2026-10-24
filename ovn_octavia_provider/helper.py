@@ -4448,16 +4448,20 @@ class OvnProviderHelper():
         return _VipReach(networks, switches)
 
     def _unreachable_members(self, ovn_lb, member_statuses):
-        """The ONLINE members the VIPs cannot reach; None when unknown."""
+        """The ONLINE members the VIPs cannot reach; None when unknown.
+
+        A read that fails, or finds neither a router holding the load
+        balancer nor its VIP switch, proves nothing either way.
+        """
         try:
             reach = self._vip_reach(ovn_lb)
         except Exception:
             LOG.debug('Could not read the topology of load balancer %s',
                       ovn_lb.name, exc_info=True)
             return None
-        unreachable = set()
         if reach is None:
-            return unreachable
+            return None
+        unreachable = set()
         for key, value in ovn_lb.external_ids.items():
             if not key.startswith(ovn_const.LB_EXT_IDS_POOL_PREFIX):
                 continue
@@ -4514,7 +4518,9 @@ class OvnProviderHelper():
             return member_statuses
         unreachable = self._unreachable_members(ovn_lb, member_statuses)
         if unreachable is None:
-            return member_statuses
+            # Nothing read either way: the last verdict stands.
+            unreachable = self._recorded_unreachable(ovn_lb) & set(
+                member_statuses)
         withheld = dict(member_statuses)
         for mb_id in sorted(unreachable):
             LOG.warning('Load balancer %s member %s answers its health '

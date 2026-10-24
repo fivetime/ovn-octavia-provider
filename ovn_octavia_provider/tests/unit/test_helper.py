@@ -9376,6 +9376,23 @@ class TestUnreachableMembers(ovn_base.TestOvnOctaviaBase):
         self.assertIsNone(self._interface_removed())
         self.driver_lib.get_loadbalancer.assert_not_called()
 
+    def test_an_inconclusive_topology_keeps_the_last_verdict(self):
+        # Neither a router holding the load balancer nor its VIP switch
+        # found: the read proved nothing, so a member recorded out of
+        # reach stays ERROR and recorded, and nothing is re-reported.
+        self.topology(on_router=False, vip_switch=False)
+        self.lb.external_ids[ovn_const.OVN_MEMBER_UNREACHABLE_KEY] = (
+            self.MEMBER_ID)
+        self.assertEqual(constants.ERROR, self.reported())
+        self.nb.db_remove.assert_not_called()
+        self.nb.db_set.assert_not_called()
+        self.assertIsNone(self._interface_removed())
+        self.driver_lib.get_loadbalancer.assert_not_called()
+        # With nothing recorded, the probe's verdict is reported as is.
+        del self.lb.external_ids[ovn_const.OVN_MEMBER_UNREACHABLE_KEY]
+        self.assertEqual(constants.ONLINE, self.reported())
+        self.nb.db_set.assert_not_called()
+
     def test_the_switch_addresses_are_read_once_per_report(self):
         other = 'member-2'
         self.lb.external_ids['pool_%s' % self.POOL] += (
