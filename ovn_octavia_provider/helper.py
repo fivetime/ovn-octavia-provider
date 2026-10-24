@@ -4687,29 +4687,29 @@ class OvnProviderHelper():
     def hm_update_event(self, info):
         statuses = []
         for ovn_lb in info['ovn_lbs']:
-            if not self._hm_event_is_news(ovn_lb, info):
+            verdict = self._hm_event_verdict(ovn_lb, info)
+            if verdict is None:
                 continue
+            # The hold comes first: an event behind a held one is kept, in
+            # order, whatever it says, and a repeated verdict behind an
+            # operation waits for its report rather than being dropped.
             if self._hold_hm_event(ovn_lb, info):
+                continue
+            if not self._hm_event_is_news(ovn_lb, verdict):
                 continue
             status = self._hm_update_event_lb(ovn_lb, info)
             if status:
                 statuses.append(status)
         return self._merge_statuses(statuses)
 
-    def _hm_event_is_news(self, ovn_lb, info):
-        """Whether the event says anything the stored statuses do not.
+    def _hm_event_is_news(self, ovn_lb, verdict):
+        """Whether the verdict differs from the stored member status.
 
         The agent's start replays every monitor already offline, and a
         monitor re-created for a member known to be down repeats the
-        verdict; applying either costs a status read, a transaction and
-        a report that change nothing. An event behind a held one is
-        kept, in order, whatever it says.
+        verdict; applying either costs a transaction and a report that
+        change nothing.
         """
-        if ovn_lb.name in self._held_hm_events:
-            return True
-        verdict = self._hm_event_verdict(ovn_lb, info)
-        if verdict is None:
-            return False
         member_id, member_status = verdict
         if self._find_member_status(ovn_lb, member_id) != member_status:
             return True

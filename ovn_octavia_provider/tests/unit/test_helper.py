@@ -7496,9 +7496,37 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
             self._set_hm_lb_members([(member, '10.0.0.1', '80')],
                                     {member: recorded})
             self.assertIsNone(self._hm_event('10.0.0.1', '80', status))
-        self.lb_in_flight.assert_not_called()
+        # Whether to hold is settled first, so the API is still asked.
+        self.assertEqual(2, self.lb_in_flight.call_count)
         self.helper.ovn_nbdb_api.db_set.assert_not_called()
         self.octavia_driver_lib.get_loadbalancer.assert_not_called()
+
+    @mock.patch.object(ovn_helper.OvnProviderHelper,
+                       '_ensure_hm_release_thread', return_value=True)
+    def test_hm_update_event_repeating_the_status_is_held_in_flight(
+            self, ensure_thread):
+        # The operation's report overwrites the stored verdict when it
+        # finishes; dropped as a repeat, nothing would put it back.
+        member = uuidutils.generate_uuid()
+        self._set_hm_lb_members([(member, '10.0.0.1', '80')],
+                                {member: constants.ERROR})
+        self.lb_in_flight.return_value = True
+        self.assertIsNone(self._hm_event(
+            '10.0.0.1', '80', ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE))
+        ensure_thread.assert_called_once_with()
+        self.assertEqual(
+            1, len(self.helper._held_hm_events[self.ovn_hm_lb.name]))
+        self.assertEqual([self.ovn_hm_lb.name], list(self.helper._hm_holds))
+
+    def test_hm_update_event_for_an_unknown_member_is_dropped_first(self):
+        member = uuidutils.generate_uuid()
+        self._set_hm_lb_members([(member, '10.0.0.1', '80')],
+                                {member: constants.ONLINE})
+        self.lb_in_flight.return_value = True
+        self.assertIsNone(self._hm_event(
+            '10.0.0.2', '80', ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE))
+        self.lb_in_flight.assert_not_called()
+        self.assertEqual({}, self.helper._held_hm_events)
 
     def test_hm_update_event_behind_a_hold_is_kept_whatever_it_says(self):
         # Held events replay in order; one judged against the stored
