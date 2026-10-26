@@ -4606,11 +4606,14 @@ class OvnProviderHelper():
         """The statuses to report after acting on the load balancer.
 
         The pool, listener and load balancer statuses follow from the
-        member statuses stored under 'neutron:member_status', a member
-        stored without one counting as up. Of the members, only those
-        given, the ones acted on, are reported, each with its stored
-        status if it has one: the rest are the health check's to report,
-        and Octavia leaves a member it is not told about alone.
+        member statuses stored under 'neutron:member_status'. A member
+        stored without one awaits the health check's first verdict, so the
+        status of its pool, and of what the pool's status decides, cannot
+        be told yet: it is left out, and the report of that verdict gives
+        it. Of the members, only those given, the ones acted on, are
+        reported, each with its stored status if it has one: the rest are
+        the health check's to report, and Octavia leaves a member or an
+        object it is not told about alone.
         """
         status = {
             constants.LOADBALANCERS: [],
@@ -4661,33 +4664,26 @@ class OvnProviderHelper():
             lb_listeners = {listener['listener_id']: listener
                             for listener in _lb.listeners}
 
-        # get pool statuses
+        # get pool statuses; None when it cannot be told yet
         for pool_id, members in pools.items():
-            for i, member in enumerate(members):
-                if member in member_statuses:
-                    members[i] = member_statuses[member]
-                else:
-                    # if we don't have local info we assume best option
-                    members[i] = constants.ONLINE
-
             _pool = lb_pools.get(pool_id)
             if not _pool:
                 _pool = self._octavia_driver_lib.get_pool(pool_id)
-            if not self._get_pool_admin_state(_pool) or not pools[pool_id]:
+            if not self._get_pool_admin_state(_pool) or not members:
                 pools[pool_id] = constants.OFFLINE
-            elif pools[pool_id] and all(constants.ERROR == member_status
-                                        for member_status in pools[pool_id]):
+            elif any(member not in member_statuses for member in members):
+                pools[pool_id] = None
+            elif all(constants.ERROR == member_statuses[member]
+                     for member in members):
                 pools[pool_id] = constants.ERROR
-            elif pools[pool_id] and any(constants.ERROR == member_status
-                                        for member_status in pools[pool_id]):
+            elif any(constants.ERROR == member_statuses[member]
+                     for member in members):
                 pools[pool_id] = constants.DEGRADED
             else:
                 pools[pool_id] = constants.ONLINE
 
-            status[constants.POOLS].append(
-                {constants.ID: pool_id,
-                 constants.PROVISIONING_STATUS: constants.ACTIVE,
-                 constants.OPERATING_STATUS: pools[pool_id]})
+            status[constants.POOLS].append(self._object_status(
+                pool_id, pools[pool_id]))
 
         # get listener statuses
         for listener_id, listener_pools in listeners.items():
@@ -4703,35 +4699,41 @@ class OvnProviderHelper():
                 _listener = self._octavia_driver_lib.get_listener(listener_id)
             if not self._get_listener_admin_state(_listener):
                 listeners[listener_id] = constants.OFFLINE
-            elif any(constants.ERROR == pool_status
-                     for pool_status in listeners[listener_id]):
-                listeners[listener_id] = constants.ERROR
-            elif any(constants.DEGRADED == pool_status
-                     for pool_status in listeners[listener_id]):
-                listeners[listener_id] = constants.DEGRADED
             else:
-                listeners[listener_id] = constants.ONLINE
+                listeners[listener_id] = self._worst_status(
+                    listeners[listener_id])
 
-            status[constants.LISTENERS].append(
-                {constants.ID: listener_id,
-                 constants.PROVISIONING_STATUS: constants.ACTIVE,
-                 constants.OPERATING_STATUS: listeners[listener_id]})
+            status[constants.LISTENERS].append(self._object_status(
+                listener_id, listeners[listener_id]))
 
         # get LB status
-        lb_status = constants.ONLINE
         if not _lb.admin_state_up:
             lb_status = constants.OFFLINE
-        elif any(constants.ERROR == status
-                 for status in listeners.values()):
-            lb_status = constants.ERROR
-        elif any(constants.DEGRADED == status
-                 for status in listeners.values()):
-            lb_status = constants.DEGRADED
-        status[constants.LOADBALANCERS].append({
-            constants.ID: ovn_lb.name,
-            constants.PROVISIONING_STATUS: constants.ACTIVE,
-            constants.OPERATING_STATUS: lb_status})
+        else:
+            lb_status = self._worst_status(listeners.values())
+        status[constants.LOADBALANCERS].append(self._object_status(
+            ovn_lb.name, lb_status))
 
+        return status
+
+    @staticmethod
+    def _worst_status(statuses):
+        """ERROR or DEGRADED if any is, None if any cannot be told yet."""
+        statuses = list(statuses)
+        if constants.ERROR in statuses:
+            return constants.ERROR
+        if None in statuses:
+            return None
+        if constants.DEGRADED in statuses:
+            return constants.DEGRADED
+        return constants.ONLINE
+
+    @staticmethod
+    def _object_status(object_id, operating_status):
+        status = {constants.ID: object_id,
+                  constants.PROVISIONING_STATUS: constants.ACTIVE}
+        if operating_status is not None:
+            status[constants.OPERATING_STATUS] = operating_status
         return status
 
     def hm_update_event(self, info):

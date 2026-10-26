@@ -13,6 +13,7 @@ fixes:
     merges the statuses into the row when the transaction commits. A new
     or re-enabled member of a monitored pool, and the members of a pool
     given a health monitor, keep their status in Octavia until the first
-    verdict, as with the amphora driver. A member whose monitor already
-    has a status, one shared with another member of the same backend, has
-    it replayed by the agent.
+    verdict, as with the amphora driver, and so do the pool, listener and
+    load balancer whose status depends on that verdict. A member whose
+    monitor already has a status, one shared with another member of the
+    same backend, has it replayed by the agent.

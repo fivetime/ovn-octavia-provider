@@ -543,21 +543,60 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
               constants.PROVISIONING_STATUS: constants.ACTIVE,
               constants.OPERATING_STATUS: constants.NO_MONITOR}],
             status['members'])
-        # A member stored without a status counts as up.
-        self.assertEqual(constants.ONLINE,
-                         status['pools'][0]['operating_status'])
+        # A member stored without a status awaits its first verdict: the
+        # status of its pool cannot be told yet.
+        self.assertNotIn(constants.OPERATING_STATUS, status['pools'][0])
 
     def test__get_current_operating_statuses_pool_without_members(self):
         # A pool with no members is OFFLINE; one whose members are all
-        # the health check's to report is not.
+        # the health check's to report is not told about.
         empty = uuidutils.generate_uuid()
         self.ovn_lb.external_ids['pool_%s' % empty] = ''
         self.ovn_lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY] = '{}'
         status = self.helper._get_current_operating_statuses(self.ovn_lb)
         self.assertEqual(
-            {self.pool_id: constants.ONLINE, empty: constants.OFFLINE},
-            {p[constants.ID]: p[constants.OPERATING_STATUS]
+            {self.pool_id: None, empty: constants.OFFLINE},
+            {p[constants.ID]: p.get(constants.OPERATING_STATUS)
              for p in status['pools']})
+
+    def test__get_current_operating_statuses_awaiting_a_verdict(self):
+        # Until its member's first verdict, a pool's status, and the
+        # listener's and load balancer's it decides, are left out; an
+        # ERROR elsewhere decides them anyway, and the verdict tells all.
+        other = uuidutils.generate_uuid()
+        self.ovn_lb.external_ids['pool_%s' % self.pool_id] = ','.join([
+            self.member_line,
+            'member_%s_10.0.0.2:80_%s' % (other, self.member_subnet_id)])
+        self.ovn_lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY] = (
+            jsonutils.dumps({self.member_id: constants.ONLINE}))
+
+        def operating(status):
+            return [s.get(constants.OPERATING_STATUS)
+                    for kind in ('pools', 'listeners', 'loadbalancers')
+                    for s in status[kind]]
+
+        status = self.helper._get_current_operating_statuses(self.ovn_lb)
+        self.assertEqual([None, None, None], operating(status))
+        self.assertTrue(all(s[constants.PROVISIONING_STATUS] ==
+                            constants.ACTIVE
+                            for kind in ('pools', 'listeners',
+                                         'loadbalancers')
+                            for s in status[kind]))
+
+        self.ovn_lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY] = (
+            jsonutils.dumps({self.member_id: constants.ONLINE,
+                             other: constants.ERROR}))
+        status = self.helper._get_current_operating_statuses(self.ovn_lb)
+        self.assertEqual([constants.DEGRADED] * 3, operating(status))
+
+    def test__worst_status(self):
+        worst = self.helper._worst_status
+        self.assertEqual(constants.ONLINE, worst([]))
+        self.assertEqual(constants.DEGRADED,
+                         worst([constants.ONLINE, constants.DEGRADED]))
+        self.assertIsNone(worst([constants.DEGRADED, None]))
+        self.assertEqual(constants.ERROR,
+                         worst([None, constants.ERROR, constants.DEGRADED]))
 
     def test__find_member_status(self):
         status = self.helper._find_member_status(self.ovn_lb, self.member_id)
@@ -9566,6 +9605,35 @@ class TestUnreachableMembers(ovn_base.TestOvnOctaviaBase):
         del self.lb.external_ids[ovn_const.OVN_MEMBER_UNREACHABLE_KEY]
         self.assertIsNone(self._interface_removed())
         self.driver_lib.get_loadbalancer.assert_not_called()
+
+    def test_a_router_change_re_reports_only_the_members_it_moved(self):
+        # A second member on the VIP's own subnet stays in reach when the
+        # first one's subnet leaves the router, and back.
+        other = 'member-2'
+        self.lb.external_ids['pool_%s' % self.POOL] += (
+            ',member_%s_192.168.241.20:80_subnet-a' % other)
+        self.lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY] = (
+            jsonutils.dumps({self.MEMBER_ID: constants.ONLINE,
+                             other: constants.ONLINE}))
+        self.topology(router_networks=['192.168.241.1/24'])
+        status = self._interface_removed()
+        self.assertEqual(
+            [(self.MEMBER_ID, constants.ERROR)],
+            [(m[constants.ID], m[constants.OPERATING_STATUS])
+             for m in status[constants.MEMBERS]])
+        self.lb.external_ids[ovn_const.OVN_MEMBER_UNREACHABLE_KEY] = (
+            self.MEMBER_ID)
+        self.topology(router_networks=['192.168.241.1/24',
+                                       '192.168.242.1/24'])
+        network = _Row(load_balancer=[self.lb], name='neutron-net-b',
+                       uuid='ls-b')
+        router = _Row(load_balancer=[self.lb], uuid='lr-1')
+        status = self.helper.lb_create_lrp_assoc(
+            {'network': network, 'router': router, 'is_gw_port': False})
+        self.assertEqual(
+            [(self.MEMBER_ID, constants.ONLINE)],
+            [(m[constants.ID], m[constants.OPERATING_STATUS])
+             for m in status[constants.MEMBERS]])
 
     def test_an_unreadable_topology_is_not_re_reported(self):
         self.nb.lookup.side_effect = RuntimeError('idl gone')
