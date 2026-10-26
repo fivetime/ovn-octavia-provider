@@ -3928,7 +3928,8 @@ class OvnProviderHelper():
                       str(member_statuses))
             member_statuses = {}
         for k, v in ovn_lb.external_ids.items():
-            if ovn_const.LB_EXT_IDS_POOL_PREFIX not in k or k == pool_key:
+            if (not k.startswith(ovn_const.LB_EXT_IDS_POOL_PREFIX) or
+                    k == pool_key):
                 continue
             for mb_ip, _port, _subnet, mb_id in self._extract_member_info(v):
                 if mb_ip != backend_ip or mb_id == member_id:
