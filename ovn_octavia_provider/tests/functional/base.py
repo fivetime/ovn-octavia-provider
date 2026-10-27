@@ -1087,9 +1087,18 @@ class TestOvnOctaviaBase(base.TestOVNFunctionalBase,
                                 max_retries, hm_type):
         self._o_driver_lib.update_loadbalancer_status.reset_mock()
         pool = self._get_pool_from_lb_data(lb_data, pool_id=pool_id)
+        pool_listeners = self._get_pool_listeners(lb_data, pool_id)
         pool_status = {'id': pool.pool_id,
-                       'provisioning_status': o_constants.ACTIVE,
-                       'operating_status': o_constants.ONLINE}
+                       'provisioning_status': o_constants.ACTIVE}
+        lb_status = {'id': pool.loadbalancer_id,
+                     'provisioning_status': o_constants.ACTIVE,
+                     'operating_status': o_constants.ONLINE}
+        if not pool.members:
+            pool_status['operating_status'] = o_constants.OFFLINE
+        elif pool_listeners:
+            # The pool's status, awaiting its members' first verdict, is
+            # left out, and so is the status of the load balancer it decides.
+            del lb_status['operating_status']
 
         m_hm = self._create_hm_model(pool.pool_id, name, delay, timeout,
                                      max_retries, hm_type)
@@ -1100,7 +1109,6 @@ class TestOvnOctaviaBase(base.TestOVNFunctionalBase,
             o_constants.ONLINE, o_constants.ONLINE]
 
         self.ovn_driver.health_monitor_create(m_hm)
-        pool_listeners = self._get_pool_listeners(lb_data, pool_id)
         expected_listener_status = [
             {'id': listener.listener_id,
              'provisioning_status': o_constants.ACTIVE}
@@ -1117,9 +1125,7 @@ class TestOvnOctaviaBase(base.TestOVNFunctionalBase,
         expected_status = {
             'pools': [pool_status],
             'members': expected_member_status,
-            'loadbalancers': [{'id': pool.loadbalancer_id,
-                               'provisioning_status': o_constants.ACTIVE,
-                               'operating_status': o_constants.ONLINE}],
+            'loadbalancers': [lb_status],
             'listeners': expected_listener_status,
             'healthmonitors': [expected_hm_status]
         }
