@@ -134,6 +134,9 @@ LB_SELECTION_FIELDS_MAP = {
 HM_EVENT_MEMBER_PORT_ONLINE = ['online']
 HM_EVENT_MEMBER_PORT_OFFLINE = ['offline']
 
+# Binary of the Neutron agent reporting an ovn-controller
+OVN_CONTROLLER_BINARY = 'ovn-controller'
+
 # max timeout for request
 MAX_TIMEOUT_REQUEST = 5
 

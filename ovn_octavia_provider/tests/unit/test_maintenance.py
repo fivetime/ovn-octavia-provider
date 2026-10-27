@@ -318,3 +318,65 @@ class TestDBInconsistenciesPeriodics(ovn_base.TestOvnOctaviaBase):
             'Load_Balancer', 'foo1', 'ip_port_mappings')
         self.maint.ovn_nbdb_api.db_set.assert_called_once_with(
             'Load_Balancer', 'foo1', ('ip_port_mappings', mapping1))
+
+
+class TestDeadChassisPeriodics(ovn_base.TestOvnOctaviaBase):
+
+    def setUp(self):
+        ovn_conf.register_opts()
+        super().setUp()
+        self.helper = mock.Mock()
+        self.sb_idl = mock.Mock(has_lock=True)
+        self.sb_api = mock.Mock()
+        self.neutron = mock.patch(
+            'ovn_octavia_provider.common.clients.get_neutron_client').start()
+        self.maint = maintenance.DeadChassisPeriodics(
+            self.helper, self.sb_idl, self.sb_api)
+
+    @staticmethod
+    def _agent(agent_id, alive, chassis_name=None):
+        configuration = {'chassis_name': chassis_name} if chassis_name else {}
+        return mock.Mock(id=agent_id, is_alive=alive,
+                         configuration=configuration)
+
+    def test_dead_chassis_are_handed_over(self):
+        self.neutron.return_value.agents.return_value = iter([
+            self._agent('a-1', True, 'ch-1'),
+            self._agent('a-2', False, 'ch-2'),
+            self._agent('ch-3', False)])
+        self.maint.offline_dead_chassis_monitors()
+        self.neutron.return_value.agents.assert_called_once_with(
+            binary='ovn-controller')
+        self.helper.offline_dead_chassis_monitors.assert_called_once_with(
+            self.sb_api, {'ch-2', 'ch-3'}, 3)
+
+    def test_only_the_lock_holder_acts(self):
+        self.sb_idl.has_lock = False
+        self.maint.offline_dead_chassis_monitors()
+        self.neutron.assert_not_called()
+        self.helper.offline_dead_chassis_monitors.assert_not_called()
+
+    def test_neutron_unreachable_changes_nothing(self):
+        self.neutron.return_value.agents.side_effect = Exception('down')
+        self.maint.offline_dead_chassis_monitors()
+        self.helper.offline_dead_chassis_monitors.assert_not_called()
+
+    def test_a_failure_does_not_stop_the_periodic(self):
+        self.neutron.return_value.agents.return_value = []
+        self.helper.offline_dead_chassis_monitors.side_effect = Exception()
+        self.maint.offline_dead_chassis_monitors()
+
+    def test_runs_at_the_configured_interval(self):
+        self.assertTrue(periodics.is_periodic(
+            self.maint.offline_dead_chassis_monitors))
+        self.assertEqual(
+            40, self.maint.offline_dead_chassis_monitors._periodic_spacing)
+
+    def test_an_interval_of_zero_disables_it(self):
+        ovn_conf.cfg.CONF.set_override(
+            'dead_chassis_check_interval', 0, group='ovn')
+        self.addCleanup(ovn_conf.cfg.CONF.clear_override,
+                        'dead_chassis_check_interval', group='ovn')
+        maint = maintenance.DeadChassisPeriodics(
+            self.helper, self.sb_idl, self.sb_api)
+        self.assertFalse(hasattr(maint, 'offline_dead_chassis_monitors'))

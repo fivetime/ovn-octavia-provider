@@ -79,6 +79,25 @@ ovn_opts = [
                       'connection keepalive feature. If non-zero the value '
                       'will be forced to at least 1000 milliseconds. Defaults '
                       'to 60 seconds.')),
+    cfg.IntOpt('dead_chassis_check_interval',
+               min=0,
+               default=40,
+               help=_('How often, in seconds, Neutron is asked which '
+                      'ovn-controller agents are alive. The health checks '
+                      'of members on a chassis found dead are set offline, '
+                      'as its ovn-controller, the only one probing them, '
+                      'can no longer do it. Asking is what makes Neutron '
+                      'check, at most every half agent_down_time, so this '
+                      'should be a little longer than that. Zero disables '
+                      'the check.')),
+    cfg.FloatOpt('dead_chassis_max_ratio',
+                 min=0.0,
+                 max=1.0,
+                 default=0.5,
+                 help=_('Above this share of the chassis found dead at once, '
+                        'nothing is set offline: that many failing together '
+                        'is taken for a fault of the control plane rather '
+                        'than of the chassis.')),
 ]
 
 neutron_opts = [
@@ -234,3 +253,11 @@ def get_ovn_ovsdb_retry_max_interval():
 
 def get_ovn_ovsdb_probe_interval():
     return cfg.CONF.ovn.ovsdb_probe_interval
+
+
+def get_dead_chassis_check_interval():
+    return cfg.CONF.ovn.dead_chassis_check_interval
+
+
+def get_dead_chassis_max_ratio():
+    return cfg.CONF.ovn.dead_chassis_max_ratio

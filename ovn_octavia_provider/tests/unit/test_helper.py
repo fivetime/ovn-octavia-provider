@@ -9809,3 +9809,124 @@ class TestDetachingAMemberNetwork(ovn_base.TestOvnOctaviaBase):
                            ports=[_Row(name=self.VIP_PORT)])
         self.detach(vip_network)
         self.assert_nothing_left()
+
+
+class TestDeadChassisMonitors(ovn_base.TestOvnOctaviaBase):
+
+    def setUp(self):
+        super().setUp()
+        ovn_conf.register_opts()
+        self.helper = ovn_helper.OvnProviderHelper()
+        self.sb_api = mock.MagicMock()
+        self.rows = {}
+        self.sb_api.db_find_rows.side_effect = self._find_rows
+        self.lb = mock.Mock(uuid='lb-uuid', external_ids={})
+        self.lb.name = 'lb-1'
+        mock.patch.object(self.helper, '_get_lbs_on_hm_event',
+                          return_value=[self.lb]).start()
+
+    def _find_rows(self, table, *conditions):
+        chassis = {c[0]: c[2] for c in conditions}['chassis_name']
+        return mock.Mock(**{'execute.return_value':
+                            self.rows.get(chassis, [])})
+
+    def _monitor(self, chassis, ip, port=80, remote=False,
+                 status=ovn_const.HM_EVENT_MEMBER_PORT_ONLINE):
+        row = mock.Mock(uuid='sm-%s' % ip, ip=ip, port=port, remote=remote,
+                        chassis_name=chassis, status=status)
+        self.rows.setdefault(chassis, []).append(row)
+        return row
+
+    def _pool(self, members, statuses=None):
+        pool = uuidutils.generate_uuid()
+        ids = [uuidutils.generate_uuid() for _ in members]
+        self.lb.external_ids['pool_%s' % pool] = ','.join(
+            'member_%s_%s:%s_subnet-1' % (mb_id, ip, port)
+            for mb_id, (ip, port) in zip(ids, members))
+        stored = jsonutils.loads(self.lb.external_ids.get(
+            ovn_const.OVN_MEMBER_STATUS_KEY, '{}'))
+        stored.update({ids[i]: s for i, s in (statuses or {}).items()})
+        self.lb.external_ids[ovn_const.OVN_MEMBER_STATUS_KEY] = (
+            jsonutils.dumps(stored))
+        return ids
+
+    def _offline(self, dead, total):
+        offline = self.helper.offline_dead_chassis_monitors(
+            self.sb_api, dead, total)
+        return sorted(row.ip for row in offline)
+
+    def _written(self):
+        return sorted(c.args[1] for c in self.sb_api.db_set.call_args_list)
+
+    def test_monitors_of_a_dead_chassis_are_set_offline(self):
+        self._pool([('10.0.0.1', '80'), ('10.0.0.2', '80'),
+                    ('10.0.0.3', '80')])
+        self._monitor('ch-dead', '10.0.0.1')
+        self._monitor('ch-dead', '10.0.0.2')
+        self._monitor('ch-dead', '10.0.0.9', remote=True)
+        self._monitor('ch-dead', '10.0.0.7',
+                      status=ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE)
+        self._monitor('ch-dead', '10.0.0.8', status=[])
+        self._monitor('ch-live', '10.0.0.3')
+        self.assertEqual(['10.0.0.1', '10.0.0.2'],
+                         self._offline({'ch-dead'}, 4))
+        self.sb_api.db_find_rows.assert_called_once_with(
+            'Service_Monitor', ('chassis_name', '=', 'ch-dead'))
+        self.assertEqual(['sm-10.0.0.1', 'sm-10.0.0.2'], self._written())
+        self.sb_api.db_set.assert_any_call(
+            'Service_Monitor', 'sm-10.0.0.1',
+            ('status', ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE))
+        self.assertEqual(1, self.sb_api.transaction.call_count)
+
+    def test_nothing_dead_reads_nothing(self):
+        self.assertEqual([], self._offline(set(), 4))
+        self.sb_api.db_find_rows.assert_not_called()
+
+    def test_too_many_dead_at_once_sets_nothing(self):
+        self._pool([('10.0.0.1', '80'), ('10.0.0.2', '80')])
+        self._monitor('ch-1', '10.0.0.1')
+        self._monitor('ch-2', '10.0.0.2')
+        self.assertEqual([], self._offline({'ch-1', 'ch-2', 'ch-3'}, 5))
+        self.sb_api.db_find_rows.assert_not_called()
+        self.sb_api.db_set.assert_not_called()
+
+    def test_half_of_the_chassis_dead_is_not_too_many(self):
+        self._pool([('10.0.0.1', '80'), ('10.0.0.2', '80')])
+        self._monitor('ch-1', '10.0.0.1')
+        self._monitor('ch-2', '10.0.0.5')
+        self.assertEqual(['10.0.0.1', '10.0.0.5'],
+                         self._offline({'ch-1', 'ch-2'}, 4))
+
+    def test_one_dead_chassis_is_never_too_many(self):
+        self._pool([('10.0.0.1', '80'), ('10.0.0.2', '80')])
+        self._monitor('ch-1', '10.0.0.1')
+        self.assertEqual(['10.0.0.1'], self._offline({'ch-1'}, 1))
+
+    def test_a_pool_left_with_no_member_keeps_its_monitors(self):
+        self._pool([('10.0.0.1', '80'), ('10.0.0.2', '80')])
+        self._pool([('10.0.0.5', '80'), ('10.0.0.6', '80')])
+        self._monitor('ch-dead', '10.0.0.1')
+        self._monitor('ch-dead', '10.0.0.2')
+        self._monitor('ch-dead', '10.0.0.5')
+        self.assertEqual(['10.0.0.5'], self._offline({'ch-dead'}, 4))
+        self.assertEqual(['sm-10.0.0.5'], self._written())
+
+    def test_members_already_down_are_no_survivors(self):
+        self._pool([('10.0.0.1', '80'), ('10.0.0.2', '80'),
+                    ('10.0.0.3', '80')],
+                   {1: constants.ERROR, 2: constants.OFFLINE})
+        self._monitor('ch-dead', '10.0.0.1')
+        self.assertEqual([], self._offline({'ch-dead'}, 4))
+        self.sb_api.transaction.assert_not_called()
+
+    def test_a_member_awaiting_its_verdict_is_a_survivor(self):
+        self._pool([('10.0.0.1', '80'), ('10.0.0.2', '80')],
+                   {0: constants.ONLINE})
+        self._monitor('ch-dead', '10.0.0.1')
+        self.assertEqual(['10.0.0.1'], self._offline({'ch-dead'}, 4))
+
+    def test_a_backend_found_in_no_load_balancer_is_set_offline(self):
+        self.helper._get_lbs_on_hm_event.side_effect = idlutils.RowNotFound(
+            table='Load_Balancer', col='ip_port_mappings', match='x')
+        self._monitor('ch-dead', '10.0.0.1')
+        self.assertEqual(['10.0.0.1'], self._offline({'ch-dead'}, 4))

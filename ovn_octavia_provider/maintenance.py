@@ -264,3 +264,44 @@ class DBInconsistenciesPeriodics(object):
         LOG.debug('Maintenance task: no more ip_port_mappings to format, '
                   'stopping the periodic task.')
         raise periodics.NeverAgain()
+
+
+class DeadChassisPeriodics(object):
+    """Set offline the health checks a dead chassis can no longer probe.
+
+    Neutron finds an ovn-controller dead only when its agents are listed,
+    which is also what makes the chassis report in, so the listing is
+    done here rather than waited for.
+    """
+
+    def __init__(self, helper, sb_idl, sb_api):
+        self._helper = helper
+        self._sb_idl = sb_idl
+        self._sb_api = sb_api
+        interval = ovn_conf.get_dead_chassis_check_interval()
+        if interval:
+            # A bound method takes no attributes, which periodic() sets.
+            def offline_dead_chassis_monitors():
+                self._offline_dead_chassis_monitors()
+            self.offline_dead_chassis_monitors = periodics.periodic(
+                spacing=interval)(offline_dead_chassis_monitors)
+
+    def _offline_dead_chassis_monitors(self):
+        # Only the agent holding the event lock acts, as for the events.
+        if not self._sb_idl.has_lock:
+            return
+        try:
+            agents = list(clients.get_neutron_client().agents(
+                binary=ovn_const.OVN_CONTROLLER_BINARY))
+        except Exception:
+            LOG.warning('Could not list the ovn-controller agents, leaving '
+                        'the health checks as they are', exc_info=True)
+            return
+        dead = {(agent.configuration or {}).get('chassis_name') or agent.id
+                for agent in agents if not agent.is_alive}
+        try:
+            self._helper.offline_dead_chassis_monitors(
+                self._sb_api, dead, len(agents))
+        except Exception:
+            LOG.exception('Could not set offline the health checks of the '
+                          'dead chassis %s', ', '.join(sorted(dead)))

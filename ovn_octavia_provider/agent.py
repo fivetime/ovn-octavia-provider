@@ -65,6 +65,9 @@ def OvnProviderAgent(exit_event):
     maintenance_thread = maintenance.MaintenanceThread()
     maintenance_thread.add_periodics(
         maintenance.DBInconsistenciesPeriodics())
+    maintenance_thread.add_periodics(
+        maintenance.DeadChassisPeriodics(
+            helper, ovn_sb_idl_for_events, sb_api))
     maintenance_thread.start()
 
     LOG.info('OVN provider agent has started.')

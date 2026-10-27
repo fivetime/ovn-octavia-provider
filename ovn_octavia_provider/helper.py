@@ -4419,6 +4419,103 @@ class OvnProviderHelper():
                                   ovn_lb.name, mb_id)
                         self.sm_update_event_handler(row)
 
+    def offline_dead_chassis_monitors(self, sb_api, dead, total):
+        """Set offline the health checks of members on dead chassis.
+
+        Only the ovn-controller of the chassis a member is bound to probes
+        it, so when the chassis dies its monitors keep their last status:
+        a dead member stayed online, and in the VIPs, until the chassis
+        came back. Setting them offline makes northd drop the backends and
+        the health check event report the members ERROR. ovn-controller
+        writes its own verdict over the status on every pass, so a chassis
+        wrongly taken for dead puts the status back on its next one, and
+        one that comes back does once it has probed.
+
+        Nothing is set offline when more than the configured share of the
+        chassis is dead at once, nor for the members of a pool that would
+        be left with none: the first is likelier a fault of what reports
+        the chassis dead, and the second gains nothing if they are dead
+        and loses the pool if they are not.
+
+        :param dead: the names of the chassis found dead.
+        :param total: how many chassis there are.
+        :returns: the Service_Monitor rows set offline.
+        """
+        if not dead:
+            return []
+        if len(dead) > max(1, total * ovn_conf.get_dead_chassis_max_ratio()):
+            LOG.warning('%(dead)d of %(total)d chassis found dead at once, '
+                        'not setting their health checks offline: %(names)s',
+                        {'dead': len(dead), 'total': total,
+                         'names': ', '.join(sorted(dead))})
+            return []
+        monitors = []
+        for name in sorted(dead):
+            rows = sb_api.db_find_rows(
+                'Service_Monitor', ('chassis_name', '=', name)
+            ).execute(check_error=True)
+            monitors.extend(
+                row for row in rows
+                if row.status == ovn_const.HM_EVENT_MEMBER_PORT_ONLINE and
+                not getattr(row, 'remote', False))
+        if not monitors:
+            return []
+        kept = self._last_backends_of_a_pool(monitors)
+        offline = [row for row in monitors
+                   if (str(row.ip), str(row.port)) not in kept]
+        if not offline:
+            return []
+        with sb_api.transaction(check_error=True) as txn:
+            for row in offline:
+                txn.add(sb_api.db_set(
+                    'Service_Monitor', row.uuid,
+                    ('status', ovn_const.HM_EVENT_MEMBER_PORT_OFFLINE)))
+        for row in offline:
+            LOG.warning('Chassis %(chassis)s is dead: setting the health '
+                        'check of member %(ip)s:%(port)s offline',
+                        {'chassis': row.chassis_name, 'ip': row.ip,
+                         'port': row.port})
+        return offline
+
+    def _last_backends_of_a_pool(self, monitors):
+        """The backends of monitors whose pool would be left with none."""
+        backends = {(str(row.ip), str(row.port)) for row in monitors}
+        kept = set()
+        seen = set()
+        for row in monitors:
+            try:
+                ovn_lbs = self._get_lbs_on_hm_event(row) or []
+            except idlutils.RowNotFound:
+                continue
+            for ovn_lb in ovn_lbs:
+                if ovn_lb.uuid in seen:
+                    continue
+                seen.add(ovn_lb.uuid)
+                stored = self._stored_member_statuses(ovn_lb)
+                for key, value in ovn_lb.external_ids.items():
+                    if not key.startswith(ovn_const.LB_EXT_IDS_POOL_PREFIX):
+                        continue
+                    serving = set()
+                    survivors = False
+                    for mb_ip, mb_port, _subnet, mb_id in (
+                            self._extract_member_info(value)):
+                        if stored.get(mb_id) in (constants.OFFLINE,
+                                                 constants.ERROR):
+                            continue
+                        if (mb_ip, mb_port) in backends:
+                            serving.add((mb_ip, mb_port))
+                        else:
+                            survivors = True
+                    if serving and not survivors:
+                        LOG.warning('Load balancer %(lb)s pool %(pool)s has '
+                                    'no member left off dead chassis, '
+                                    'leaving their health checks alone',
+                                    {'lb': ovn_lb.name,
+                                     'pool': key[len(
+                                         ovn_const.LB_EXT_IDS_POOL_PREFIX):]})
+                        kept |= serving
+        return kept
+
     # NOTE(froyo) those methods are to get the admin_state_up of the pool or
     # listener independently of the type, octavia_lib when is requested by full
     # lb is returning listeners and pools as dicts, but if a pool or listener
