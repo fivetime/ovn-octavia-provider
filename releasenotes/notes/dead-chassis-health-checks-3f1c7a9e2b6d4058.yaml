@@ -1,0 +1,22 @@
+---
+features:
+  - |
+    Two new options in the ``[ovn]`` section. ``dead_chassis_check_interval``
+    (default ``40``) sets how often, in seconds, the provider agent asks
+    Neutron which ``ovn-controller`` agents are alive; ``0`` disables the
+    check. ``dead_chassis_max_ratio`` (default ``0.5``) sets the largest
+    share of the chassis that may be found dead at once before the check
+    stops acting on any of them.
+fixes:
+  - |
+    Members on a chassis that died are no longer reported ``ONLINE``, and
+    they no longer receive traffic. Only the ``ovn-controller`` of a
+    member's chassis probes the member, so after the chassis died its
+    ``Service_Monitor`` kept its last status, ``online``, until the chassis
+    came back. The provider agent now sets those health checks ``offline``
+    once Neutron finds the chassis dead, which takes about one to two
+    minutes with the default ``agent_down_time``. OVN then drops the
+    backends and the members are reported ``ERROR``. When the chassis comes
+    back, its ``ovn-controller`` writes its own status again and the members
+    recover. Nothing is set offline for the members of a pool that has no
+    other member left to serve.

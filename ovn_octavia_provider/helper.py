@@ -4615,14 +4615,14 @@ class OvnProviderHelper():
                     unreachable.add(mb_id)
         return unreachable
 
-    def _recorded_unreachable(self, ovn_lb):
+    def _get_recorded_unreachable(self, ovn_lb):
         """The members last reported ERROR for being out of reach."""
         recorded = ovn_lb.external_ids.get(
             ovn_const.OVN_MEMBER_UNREACHABLE_KEY)
         return set(recorded.split(',')) if recorded else set()
 
     def _record_unreachable(self, ovn_lb, unreachable):
-        if unreachable == self._recorded_unreachable(ovn_lb):
+        if unreachable == self._get_recorded_unreachable(ovn_lb):
             return
         try:
             if unreachable:
@@ -4657,7 +4657,7 @@ class OvnProviderHelper():
         unreachable = self._unreachable_members(ovn_lb, member_statuses)
         if unreachable is None:
             # Nothing read either way: the last verdict stands.
-            unreachable = self._recorded_unreachable(ovn_lb) & set(
+            unreachable = self._get_recorded_unreachable(ovn_lb) & set(
                 member_statuses)
         withheld = dict(member_statuses)
         for mb_id in sorted(unreachable):
@@ -4689,7 +4689,7 @@ class OvnProviderHelper():
                 unreachable = self._unreachable_members(ovn_lb, recorded)
                 if unreachable is None:
                     continue
-                changed = unreachable ^ self._recorded_unreachable(ovn_lb)
+                changed = unreachable ^ self._get_recorded_unreachable(ovn_lb)
                 if not changed:
                     continue
                 # The members the change put out of reach, or brought back.
